@@ -70,10 +70,21 @@ This project went through multiple iterations:
 The final version does not simply maximize complexity. It balances accuracy, interpretability, stability, and ethical interpretation.
 
 ## Repository Structure
-├── Final.qmd
-├── Final.pdf
-├── Final_Capstone_Presentation.pptx
+predicting-student-romantic-relationship-status/
+│
+├── README.md
+├── .gitignore
+│
+├── report/
+│   ├── Final.qmd
+│   ├── Final.pdf
+│
+├── presentation/
+│   ├── Final_Capstone_Presentation.pptx
+│
 ├── data/
+│   ├── student-mat.csv
+│   ├── student-por.csv
+│
 ├── versions/
-├── outputs/
 └── figures/
