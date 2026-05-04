@@ -88,3 +88,6 @@ predicting-student-romantic-relationship-status/
 ├── final_project_8_probability.qmd
 └── final_project_9_pooled_clean.qmd
 ```
+## Ethical Note
+
+This model should not be used to label, rank, or monitor individual students. It is intended for educational and research understanding of broad patterns in adolescent relationship involvement. 
