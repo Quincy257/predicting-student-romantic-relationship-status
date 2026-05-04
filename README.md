@@ -61,13 +61,14 @@ This project went through multiple iterations:
 
 1. Initial baseline modeling with logistic regression and random forest.
 2. Student-level duplicate handling across Math and Portuguese course files.
-3. Sex-specific modeling for female and male students.
-4. Course-level grouped analysis to test whether keeping both course records improved prediction.
-5. Ensemble and stacking comparison.
-6. Probability-focused evaluation with calibration and KDE diagnostics.
-7. Final pooled student-level model with sex retained as a predictor.
+3. Feature engineering for behavioral, academic, and family-background variables.
+4. Sex-specific modeling for female and male students.
+5. Course-level grouped analysis to test whether keeping both course records improved prediction.
+6. Ensemble and stacking comparison.
+7. Probability-focused evaluation with calibration and KDE diagnostics.
+8. Final pooled student-level model with sex retained as a predictor.
 
-The final version does not simply maximize complexity. It balances accuracy, interpretability, stability, and ethical interpretation.
+The final version does not simply maximize complexity. It balances predictive performance, interpretability, stability, and ethical interpretation.
 
 ## Repository Structure
 
