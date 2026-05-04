@@ -70,21 +70,20 @@ This project went through multiple iterations:
 The final version does not simply maximize complexity. It balances accuracy, interpretability, stability, and ethical interpretation.
 
 ## Repository Structure
+
+```text
 predicting-student-romantic-relationship-status/
-│
 ├── README.md
-├── .gitignore
-│
-├── report/
-│   ├── Final.qmd
-│   ├── Final.pdf
-│
-├── presentation/
-│   ├── Final_Capstone_Presentation.pptx
-│
-├── data/
-│   ├── student-mat.csv
-│   ├── student-por.csv
-│
-├── versions/
-└── figures/
+├── Final_.pdf
+├── Final_Capstone_Presentation.pptx
+├── Final_code.qmd
+├── student-mat.csv
+├── student-por.csv
+├── Final_project - E5.qmd
+├── Final_project---E6.rmarkdown
+├── final_project_e6.qmd
+├── final_project_7.qmd
+├── final_project_7 .2.qmd
+├── final_project_8_probability.qmd
+└── final_project_9_pooled_clean.qmd
+```
