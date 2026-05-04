@@ -1,0 +1,2465 @@
+---
+title: "Predict Student Romantic Relationship Status"
+author: "Weiyang Sheng"
+format: pdf
+editor: visual
+---
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+## keep this chunk!
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  tidy = "styler",
+  fig.align = "center"
+)
+```
+
+## Project setup
+
+This chunk loads the packages used throughout the analysis and fixes the random seed so the workflow is reproducible. It provides the software foundation for the entire project.
+
+```{r setup, message=FALSE, warning=FALSE}
+# This chunk loads the packages used throughout the project.
+# It also fixes the random seed so that the workflow is reproducible.
+# The goal is to keep the analysis stable and transparent.
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(DALEX)
+library(stacks)
+options(yardstick.event_first = FALSE)
+library(discrim)
+library(xgboost)
+library(kernlab)
+library(nnet)
+library(klaR)
+library(finetune)
+set.seed(123)
+library(broom)
+```
+
+This chunk does not produce a substantive analytical result by itself. Its main purpose is to prepare a stable and reproducible environment for the rest of the project.
+
+## Data import and sample construction
+
+This chunk reads the Math and Portuguese course datasets, identifies overlapping students, and constructs a cleaner combined sample. Its role in the paper is to show that the final analysis is based on a more careful student-level dataset rather than a simple row bind of the two files.
+
+```{r import}
+# This chunk reads the Math and Portuguese datasets.
+# It identifies overlapping students and merges repeated records into one student-level row.
+# The goal is to build the main analysis sample and avoid double-counting the same student.
+student_por <- read_csv("student-por.csv")
+student_mat <- read_csv("student-mat.csv")
+
+student_mat <- student_mat %>% mutate(course = "Math")
+student_por <- student_por %>% mutate(course = "Portuguese")
+
+id_vars <- c(
+  "school","sex","age","address","famsize","Pstatus",
+  "Medu","Fedu","Mjob","Fjob","reason","nursery","internet"
+)
+
+
+dup_students <- inner_join(
+  student_mat %>% dplyr::select(all_of(id_vars)) %>% distinct(),
+  student_por %>% dplyr::select(all_of(id_vars)) %>% distinct(),
+  by = id_vars
+)
+
+nrow(dup_students)   # overlap count based on id_vars
+
+mode_value <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+rounded_mean_or_na <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  round(mean(as.numeric(x), na.rm = TRUE))
+}
+
+mean_or_na <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  mean(as.numeric(x), na.rm = TRUE)
+}
+
+# Keep these variables on their original discrete scales so merging does not create awkward values such as 1.5 or 2.5
+rounded_merge_vars <- c(
+  "traveltime", "studytime", "failures", "famrel",
+  "freetime", "goout", "Dalc", "Walc", "health"
+)
+
+# These variables can be merged using the mean
+mean_merge_vars <- c("absences", "G1", "G2", "G3")
+
+# Merge yes/no variables using the mode
+yesno_merge_vars <- c("schoolsup", "famsup", "paid", "activities", "higher", "romantic")
+
+# Merge other categorical variables using the mode
+categorical_merge_vars <- c("guardian")
+
+student_all <- bind_rows(student_mat, student_por) %>%
+  tidyr::unite("student_id", all_of(id_vars), sep = "__", remove = FALSE) %>%
+  dplyr::group_by(student_id) %>%
+  dplyr::summarise(
+    dplyr::across(all_of(id_vars), ~ dplyr::first(.x)),
+    course = dplyr::if_else(dplyr::n_distinct(course) > 1, "Both", dplyr::first(course)),
+    dplyr::across(any_of(rounded_merge_vars), rounded_mean_or_na),
+    dplyr::across(any_of(mean_merge_vars), mean_or_na),
+    dplyr::across(any_of(yesno_merge_vars), ~ mode_value(as.character(.x))),
+    dplyr::across(any_of(categorical_merge_vars), ~ mode_value(as.character(.x))),
+    .groups = "drop"
+  ) %>%
+  dplyr::select(-student_id)
+nrow(student_all)
+readr::write_csv(student_all, "student_all_merged.csv")
+
+```
+
+**Interpretation.** This output shows that there is substantial overlap between the two course files, so merging repeated records is necessary before modeling. After repeated records are combined, the final analytic sample contains 662 unique students. In simple terms, the project is working at the student level rather than double-counting the same person across two subjects.
+
+## Data cleaning and feature engineering
+
+This chunk converts raw variables into analysis-ready predictors, including parental education percentages, SES-style job groupings, age groups, and alcohol-related measures. It also creates the train/test split and the sex-specific subsets, which are central to the predictive and moderator-based design of the paper.
+
+```{r}
+# This chunk converts raw variables into analysis-ready features.
+# It recodes variables, creates grouped and percentage-based predictors,
+# and builds the train/test split for the pooled and sex-specific datasets.
+students <- student_all %>%
+  mutate(
+    romantic   = factor(romantic, levels = c("no", "yes")),
+    sex        = factor(sex),
+    address    = factor(address),
+    Mjob       = factor(Mjob),
+    Fjob       = factor(Fjob),
+   Medu       = as.numeric(Medu),
+Fedu       = as.numeric(Fedu),
+Medu_pct   = 100 * Medu / 4,
+Fedu_pct   = 100 * Fedu / 4,
+edu_gap_pct = abs(Medu_pct - Fedu_pct),
+    Mjob_ses = case_when(
+      Mjob %in% c("teacher", "health") ~ "higher",
+      Mjob %in% c("services") ~ "middle",
+      TRUE ~ "lower"
+    ),
+    Mjob_ses = factor(Mjob_ses, levels = c("lower","middle","higher")),
+    Fjob_ses = case_when(
+      Fjob %in% c("teacher", "health") ~ "higher",
+      Fjob %in% c("services") ~ "middle",
+      TRUE ~ "lower"
+    ),
+    Fjob_ses = factor(Fjob_ses, levels = c("lower","middle","higher")),
+    activities = factor(activities, levels = c("no","yes")),
+    higher     = factor(higher,     levels = c("no","yes")),
+    internet   = factor(internet,   levels = c("no","yes")),
+    age        = as.numeric(age),
+    studytime  = as.numeric(studytime),
+    freetime   = as.numeric(freetime),
+    goout      = as.numeric(goout),
+    Dalc       = as.numeric(Dalc),
+    Walc       = as.numeric(Walc),
+    age_group = case_when(
+      age <= 16 ~ "15-16",
+      age == 17 ~ "17",
+      age == 18 ~ "18",
+      age >= 19 ~ "19+"
+    ),
+    age_group = factor(age_group, levels = c("15-16","17","18","19+")),
+    alc_mean = (Dalc + Walc) / 2,
+    alc_risk = factor(if_else(Walc >= 4 | Dalc >= 3, "higher", "lower"),
+                      levels = c("lower","higher")),
+    freetime_pct  = 100 * (freetime  - 1) / 4,
+    goout_pct     = 100 * (goout     - 1) / 4,
+    studytime_pct = 100 * (studytime - 1) / 3,
+    alc_mean_pct  = 100 * (alc_mean  - 1) / 4
+  )
+
+set.seed(123)
+splits <- initial_split(students, prop = 0.8, strata = romantic)
+train_data <- training(splits)
+test_data  <- testing(splits)
+train_data_mod <- train_data
+test_data_mod  <- test_data
+
+train_F <- train_data %>% filter(sex == "F")
+test_F  <- test_data  %>% filter(sex == "F")
+
+train_M <- train_data %>% filter(sex == "M")
+test_M  <- test_data  %>% filter(sex == "M")
+
+train_F_mod <- train_F %>% dplyr::select(-sex)
+test_F_mod  <- test_F  %>% dplyr::select(-sex)
+
+train_M_mod <- train_M %>% dplyr::select(-sex)
+test_M_mod  <- test_M  %>% dplyr::select(-sex)
+
+prop.table(table(train_data$romantic))
+prop.table(table(test_data$romantic))
+```
+
+**Interpretation.** These outputs show that the train and test sets have almost the same class balance. About 62.5% of students are in the `no` group and about 37.5% are in the `yes` group in both splits. That means the stratified split worked well and the held-out test set remains comparable to the training data.
+
+## Plot analysis: mother's and father's education
+
+This chunk explores whether mother and father education are associated with relationship status after centering the pattern around each sex-specific baseline. Its role is to compare maternal and paternal education effects and to see whether either side of family education separates the outcome more clearly.
+
+```{r}
+# This chunk compares relationship rates across mother and father education levels.
+# The patterns are centered around each sex-specific average so the plot shows
+# whether a group sits above or below the typical level within females or males.
+edu_base <- students %>%
+  group_by(sex) %>%
+  summarise(base = mean(romantic == "yes"), .groups = "drop")
+
+edu_parent <- students %>%
+  dplyr::select(sex, romantic, Medu_pct, Fedu_pct) %>%
+  pivot_longer(
+    cols = c(Medu_pct, Fedu_pct),
+    names_to = "parent",
+    values_to = "edu_pct"
+  ) %>%
+  mutate(
+    parent = recode(parent, Medu_pct = "Mother", Fedu_pct = "Father"),
+    edu_pct = factor(edu_pct, levels = c(0, 25, 50, 75, 100))
+  ) %>%
+  group_by(sex, parent, edu_pct) %>%
+  summarise(prop_yes = mean(romantic == "yes"), n = n(), .groups = "drop") %>%
+  left_join(edu_base, by = "sex") %>%
+  mutate(delta_pp = 100 * (prop_yes - base))
+
+pad_parent <- 2
+
+edu_parent_mother <- edu_parent %>% filter(parent == "Mother")
+ylim_m <- range(edu_parent_mother$delta_pp, na.rm = TRUE)
+
+ggplot(edu_parent_mother, aes(x = edu_pct, y = delta_pp, group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = n), alpha = 0.9) +
+  facet_wrap(~ sex, nrow = 1) +
+  scale_y_continuous(labels = function(x) paste0(x, " pp")) +
+  coord_cartesian(ylim = c(ylim_m[1] - pad_parent, ylim_m[2] + pad_parent)) +
+  labs(
+    title = "Mother education and relationship rate (difference from sex average)",
+    x = "Education level (0–100%)",
+    y = "Difference from sex average (percentage points)",
+    size = "N"
+  ) +
+  theme_minimal()
+
+edu_parent_father <- edu_parent %>% filter(parent == "Father")
+ylim_f <- range(edu_parent_father$delta_pp, na.rm = TRUE)
+
+ggplot(edu_parent_father, aes(x = edu_pct, y = delta_pp, group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = n), alpha = 0.9) +
+  facet_wrap(~ sex, nrow = 1) +
+  scale_y_continuous(labels = function(x) paste0(x, " pp")) +
+  coord_cartesian(ylim = c(ylim_f[1] - pad_parent, ylim_f[2] + pad_parent)) +
+  labs(
+    title = "Father education and relationship rate (difference from sex average)",
+    x = "Education level (0–100%)",
+    y = "Difference from sex average (percentage points)",
+    size = "N"
+  ) +
+  theme_minimal()
+
+```
+
+**Mother education plot.** For this plot, the dashed horizontal line marks the average relationship rate within each sex, the line shows how each mother-education group moves above or below that sex-specific average, and the point size shows how many students are in each group. The main message is that the pattern is not smooth or monotonic. The lowest mother-education group sits clearly below the sex-specific average, but those extreme points are also based on small groups. Once we move into the middle education levels, most points are much closer to zero, which suggests that mother education alone is not a strong and stable descriptive separator of relationship status.
+
+**Father education plot.** The father-education figure is read in the same way: the dashed line marks the sex-specific average, the line shows whether each education group is above or below that average, and the point size shows the group sample size. Compared with the mother-education plot, the father-education pattern is still mixed rather than clearly increasing or decreasing. Some low-education groups appear above average, but many of those cells are small, and the middle-to-high levels mostly move close to zero. So father education does not provide a strong standalone descriptive signal either.
+
+## Dependency check: family background and going out
+
+This chunk tests whether parental education and parental job SES are related to students’ going-out behavior. Its role in the paper is to examine whether family-background variables may work indirectly through more immediate social-exposure variables.
+
+```{r}
+# ===== Dependency check example: does parental SES predict goout? =====
+goout_lm <- lm(goout ~ Medu_pct + Fedu_pct + Mjob_ses + Fjob_ses + sex, data = students)
+summary(goout_lm)
+
+# A simple visualization (mean goout by parental SES)
+students %>%
+  group_by(sex, Mjob_ses) %>%
+  summarise(goout_mean = mean(goout, na.rm = TRUE), n = n(), .groups = "drop") %>%
+  ggplot(aes(x = Mjob_ses, y = goout_mean)) +
+  geom_col() +
+  facet_wrap(~ sex) +
+  labs(
+    title = "Is going-out behavior associated with mother's job SES?",
+    x = "Mother job SES",
+    y = "Mean goout (1–5)"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** The regression output shows that parental education and parental job SES explain very little of the variation in going-out behavior. The overall model is not statistically strong, and the explained variance is very small. The bar plot tells the same story visually: most bars are clustered around a similar level, with only modest movement across mother-job SES groups. In practical terms, family-background variables do not seem to shape going-out behavior strongly in this sample.
+
+## Plot analysis: education gap
+
+This chunk examines whether the gap between mother’s and father’s education levels is associated with relationship status, and whether the pattern differs by sex. Its role is to evaluate whether educational mismatch in the family adds information beyond the two separate parent-education measures.
+
+```{r}
+# This chunk examines whether the gap between mother and father education
+# is associated with relationship status, and whether the pattern differs by sex.
+# The plot shows raw proportions before any baseline centering.
+students %>%
+  group_by(sex, edu_gap_pct) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = edu_gap_pct, y = prop_yes, color = sex, group = sex)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = c(0, 25, 50, 75, 100)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Education Gap (0–100%) vs Relationship Rate",
+    x = "Gap between parents' education (0–100%)",
+    y = "Proportion (romantic = yes)",
+    color = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, each point shows the observed relationship rate at one parental-education-gap level, and the two lines compare females and males. Female students show more visible fluctuation across the gap levels, especially at the high-gap end, while male students stay relatively flat until the most extreme point. However, the pattern is not smooth, and the most extreme values are likely unstable because those groups are very small. So this figure is useful descriptively, but it should be read with caution rather than as evidence of a clean linear trend.
+
+## Group-size check for education gap
+
+This chunk reports the sample size behind each education-gap category. Its role is to prevent over-interpretation of visually extreme points that may be driven by very small groups.
+
+```{r}
+# This chunk reports the sample size behind each education-gap category.
+# It helps evaluate whether the visually extreme points in the previous plot
+# are based on enough observations to support interpretation.
+students %>%
+  group_by(sex, edu_gap_pct) %>%
+  summarise(
+    n = n(),
+    yes_n = sum(romantic == "yes"),
+    prop_yes = mean(romantic == "yes"),
+    .groups = "drop"
+  ) %>%
+  arrange(sex, edu_gap_pct)
+```
+
+**Interpretation.** This table shows why the previous education-gap pattern needs to be interpreted carefully. The low- and middle-gap groups have reasonably large sample sizes, but the extreme groups are much smaller. That means the most dramatic points in the earlier plot are much more likely to reflect sampling noise than a stable underlying pattern.
+
+## Plot analysis: education gap relative to each sex baseline
+
+This chunk re-expresses the education-gap pattern as a difference from the average relationship rate within each sex. Its role is to make the education-gap signal easier to interpret in relative rather than raw-percentage terms.
+
+```{r}
+# This chunk re-expresses the education-gap pattern as a difference from
+# the average relationship rate within each sex. This makes it easier to see
+# whether a given gap group is above or below the usual level for females or males.
+gap_base <- students %>%
+  group_by(sex) %>%
+  summarise(base = mean(romantic == "yes"), .groups = "drop")
+
+gap_df <- students %>%
+  mutate(
+    gap_group = case_when(
+      edu_gap_pct == 0 ~ "0",
+      edu_gap_pct == 25 ~ "25",
+      edu_gap_pct == 50 ~ "50",
+      edu_gap_pct >= 75 ~ "75-100"
+    ),
+    gap_group = factor(gap_group, levels = c("0", "25", "50", "75-100"))
+  ) %>%
+  group_by(sex, gap_group) %>%
+  summarise(prop_yes = mean(romantic == "yes"), n = n(), .groups = "drop") %>%
+  left_join(gap_base, by = "sex") %>%
+  mutate(delta_pp = 100 * (prop_yes - base))
+
+ylim_gap <- range(gap_df$delta_pp, na.rm = TRUE)
+pad_gap <- 2
+
+ggplot(gap_df, aes(x = gap_group, y = delta_pp, group = sex, color = sex)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = n), alpha = 0.9) +
+  scale_y_continuous(labels = function(x) paste0(x, " pp")) +
+  coord_cartesian(ylim = c(ylim_gap[1] - pad_gap, ylim_gap[2] + pad_gap)) +
+  labs(
+    title = "Education gap and relationship rate (difference from sex average)",
+    x = "Gap between parents' education",
+    y = "Difference from sex average (percentage points)",
+    color = "Sex",
+    size = "N"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, the dashed line marks the sex-specific average, the line shows whether each education-gap group is above or below that average, and the point size shows the sample size. Most points stay fairly close to zero, especially for males, which suggests that parental education gap is not a strong standalone predictor after we center within sex. The one big positive jump for females in the highest-gap group looks visually striking, but it is also based on a very small group, so it should not be over-interpreted.
+
+## Heatmap analysis: joint parent-education patterns
+
+These heatmaps show total sample size, relationship count, and relationship rate across combinations of mother’s and father’s education levels. Their role is to distinguish between cells that are large and cells that are actually higher in relationship prevalence, while also flagging low-N combinations.
+
+```{r}
+# This chunk builds joint mother-education and father-education combinations.
+# It prepares three heatmap views for each sex: total sample size, relationship count,
+# and relationship rate. Together, these plots distinguish large cells from high-rate cells.
+edu_combo <- students %>%
+  mutate(
+    Medu_cat = factor(Medu, levels = 0:4),
+    Fedu_cat = factor(Fedu, levels = 0:4)
+  ) %>%
+  group_by(sex, Medu_cat, Fedu_cat) %>%
+  summarise(
+    yes_n  = sum(romantic == "yes"),
+    no_n   = sum(romantic == "no"),
+    n      = n(),
+    prop_yes = yes_n / n,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Flag very small cells so they can be treated cautiously in the visual summaries
+    n_flag = if_else(n < 5, "Low N", "OK"),
+    
+    # In the rate heatmap, suppress percentage labels for very small cells
+    rate_label = if_else(
+      n >= 5,
+      paste0(scales::percent(prop_yes, accuracy = 1), "\n(n=", n, ")"),
+      paste0("n=", n)
+    ),
+    
+    count_label = paste0("yes=", yes_n, "\nN=", n),
+    all_label   = paste0("N=", n),
+    
+    # Use white text on darker cells and black text on lighter cells
+    text_col_count = if_else(yes_n >= median(yes_n, na.rm = TRUE), "white", "black"),
+    text_col_all   = if_else(n >= median(n, na.rm = TRUE), "white", "black"),
+    text_col_rate  = if_else(prop_yes >= 0.50, "white", "black"),
+    
+    # For the rate heatmap, mark low-N cells as NA so they appear in grey
+    prop_yes_plot = if_else(n >= 5, prop_yes, NA_real_)
+  )
+
+fill_max_n   <- max(edu_combo$n, na.rm = TRUE)
+fill_max_yes <- max(edu_combo$yes_n, na.rm = TRUE)
+
+plot_heatmap_all_n <- function(df_sex, sex_label) {
+  ggplot(df_sex, aes(x = Medu_cat, y = Fedu_cat, fill = n)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = all_label, color = text_col_all), size = 3) +
+    scale_color_identity() +
+    scale_fill_gradient(
+      low = "white",
+      high = "steelblue",
+      limits = c(0, fill_max_n),
+      breaks = scales::pretty_breaks(n = 5),
+      na.value = "grey90"
+    ) +
+    labs(
+      title = paste0("All students by parents' education (", sex_label, ")"),
+      x = "Mother education (0–4)",
+      y = "Father education (0–4)",
+      fill = "Total N"
+    ) +
+    theme_minimal()
+}
+
+plot_heatmap_yes_n <- function(df_sex, sex_label) {
+  ggplot(df_sex, aes(x = Medu_cat, y = Fedu_cat, fill = yes_n)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = count_label, color = text_col_count), size = 3) +
+    scale_color_identity() +
+    scale_fill_gradient(
+      low = "white",
+      high = "orange",
+      limits = c(0, fill_max_yes),
+      breaks = scales::pretty_breaks(n = 5),
+      na.value = "grey90"
+    ) +
+    labs(
+      title = paste0("Students in a relationship by parents' education (", sex_label, ")"),
+      x = "Mother education (0–4)",
+      y = "Father education (0–4)",
+      fill = "Yes count"
+    ) +
+    theme_minimal()
+}
+
+plot_heatmap_yes_rate <- function(df_sex, sex_label) {
+  ggplot(df_sex, aes(x = Medu_cat, y = Fedu_cat, fill = prop_yes_plot)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = rate_label, color = text_col_rate), size = 3) +
+    scale_color_identity() +
+    scale_fill_gradient2(
+      low = "blue",
+      mid = "white",
+      high = "red",
+      midpoint = 0.50,
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.25),
+      labels = scales::percent_format(accuracy = 1),
+      na.value = "grey85"
+    ) +
+    labs(
+      title = paste0("Relationship rate by parents' education (", sex_label, ", grey = low N < 5)"),
+      x = "Mother education (0–4)",
+      y = "Father education (0–4)",
+      fill = "Yes rate"
+    ) +
+    theme_minimal()
+}
+
+# Female
+plot_heatmap_all_n(edu_combo %>% filter(sex == "F"), "Female")
+plot_heatmap_yes_n(edu_combo %>% filter(sex == "F"), "Female")
+plot_heatmap_yes_rate(edu_combo %>% filter(sex == "F"), "Female")
+
+# Male
+plot_heatmap_all_n(edu_combo %>% filter(sex == "M"), "Male")
+plot_heatmap_yes_n(edu_combo %>% filter(sex == "M"), "Male")
+plot_heatmap_yes_rate(edu_combo %>% filter(sex == "M"), "Male")
+```
+
+**Female total-N heatmap.** For this heatmap, the color intensity shows how many female students fall into each mother-father education combination, and the text inside each tile gives the exact sample size. The key pattern is that the data are concentrated in the middle and upper-middle cells rather than at the extreme edges. This matters because the largest tiles should carry more interpretive weight later.
+
+**Female yes-count heatmap.** Here, the color intensity shows the number of female students in a relationship in each cell, and the text reports both the yes count and the total N. The darkest cells are mostly the same cells that were already large in the total-N map, which means high yes counts partly reflect large group size rather than especially high prevalence.
+
+**Female yes-rate heatmap.** In this heatmap, the fill color shows the relationship rate within each mother-father education combination, and the labels report both the percentage and the group size. The grey cells mean the sample size is too small to trust. Among the more stable female cells, the rates mostly sit in a moderate range rather than climbing steadily with parent education, so the pattern is patchy rather than monotonic.
+
+**Male total-N heatmap.** The male total-N map shows that the sample is also concentrated in the middle and higher education cells rather than at the low-education corners. This means later rate patterns should be read mainly from those larger cells, not from the very sparse edge combinations.
+
+**Male yes-count heatmap.** The cells with the largest male yes counts are mostly the same cells that also contain the most students overall. This tells us that raw yes counts alone do not imply a stronger relationship effect; they mainly show where the data are concentrated.
+
+**Male yes-rate heatmap.** Compared with the female map, the male rates look even more muted and scattered. Several stable cells sit in a moderate range, and the higher parent-education combinations are not consistently higher than the middle ones. So, again, joint parental education does not appear to be a strong or simple descriptive separator for male relationship status.
+
+## Basic descriptive comparison by sex
+
+This chunk gives the overall relationship rate for female and male students. Its role is to establish the baseline sex difference before moving into subgroup-specific modeling.
+
+```{r}
+# This chunk provides the overall relationship rate for female and male students.
+# It is meant to establish the baseline sex difference before moving into
+# subgroup-specific models and interpretations.
+students %>%
+  group_by(sex) %>%
+  summarise(prop_yes = mean(romantic == "yes"), n = n(), .groups = "drop") %>%
+  ggplot(aes(x = sex, y = prop_yes)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Relationship Rate by Sex",
+    x = "Sex",
+    y = "Proportion (romantic = yes)"
+  ) +
+  theme_minimal()
+
+```
+
+**Interpretation.** For this plot, each bar shows the overall proportion of students in a relationship within one sex. The female bar is clearly higher than the male bar, which means female students report romantic relationships more often in this sample. This is an important baseline result because it helps explain why sex is informative in the pooled model and why separate subgroup modeling is worth doing.
+
+## Plot analysis: parental job SES
+
+This chunk explores whether broader mother/father job SES groupings relate to relationship status. Its role is to test whether a simplified family-resource representation is descriptively useful before entering the predictive stage.
+
+```{r}
+# This chunk compares relationship rates across simplified parental job-SES groups
+# for both mothers and fathers, separately by sex. The goal is to see whether a broad
+# family-resource indicator offers a useful descriptive pattern before modeling.
+students %>%
+  dplyr::select(sex, romantic, Mjob_ses, Fjob_ses) %>%
+  pivot_longer(cols = c(Mjob_ses, Fjob_ses), names_to = "parent", values_to = "job_ses") %>%
+  mutate(parent = recode(parent, Mjob_ses = "Mother", Fjob_ses = "Father")) %>%
+  group_by(sex, parent, job_ses) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = job_ses, y = prop_yes)) +
+  geom_col() +
+  facet_grid(sex ~ parent) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = " Parental Job SES vs Relationship Rate (by Sex)",
+    x = "Job SES",
+    y = "Proportion (romantic = yes)"
+  ) +
+  theme_minimal()
+
+```
+
+**Interpretation.** For this plot, the bars show the relationship rate within each parental job-SES group, and the four panels separate mother versus father and female versus male students. The overall pattern is fairly flat. Female rates stay in a similar range across job-SES categories, and male rates move a little more, but not in one clear direction. This suggests that parental job SES is, at most, a weak descriptive predictor compared with the more behavior-based variables later in the paper.
+
+## Plot analysis: free time
+
+This chunk visualizes the relationship between free time and romantic status by sex. Its role is to inspect whether one of the project’s key social-exposure variables shows a descriptive pattern worth carrying into the modeling discussion.
+
+```{r}
+# This chunk visualizes the relationship between free time and relationship status,
+# separately for female and male students. It checks whether a social-availability variable
+# shows a meaningful descriptive pattern before the predictive modeling stage.
+students %>%
+  group_by(sex, freetime_pct) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = freetime_pct, y = prop_yes, color = sex, group = sex)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = c(0, 25, 50, 75, 100)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Free-time (0–100%) × Sex",
+    x = "Free-time (0–100%)",
+    y = "Proportion (romantic = yes)",
+    color = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, each point shows the observed relationship rate at one free-time level, and the two lines compare females and males. Female students are above male students at most free-time levels, but the pattern is not perfectly linear for either sex. Female rates rise sharply at some levels and then level off, while male rates dip and recover. So free time may carry signal, but the relationship is nonlinear and differs by sex rather than following one simple rule.
+
+## Plot analysis: alcohol risk
+
+This chunk compares relationship prevalence across lower- and higher-risk alcohol groups for female and male students. Its role is to test whether alcohol-related social behavior is descriptively linked to romantic status.
+
+```{r}
+# This chunk compares relationship prevalence between lower-risk and higher-risk alcohol groups,
+# separately for female and male students. It provides a simple descriptive check
+# for alcohol-related social behavior.
+students %>%
+  group_by(sex, alc_risk) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = alc_risk, y = prop_yes)) +
+  geom_col() +
+  facet_wrap(~ sex) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Alcohol Risk vs Relationship Rate (by Sex)",
+    x = "Alcohol risk",
+    y = "Proportion (romantic = yes)"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, the bars compare lower-risk and higher-risk alcohol groups within each sex. In both panels, the higher-risk group is only slightly above the lower-risk group. That means alcohol risk moves in the expected direction, but the difference is modest rather than dramatic. So alcohol may be part of the broader social-behavior pattern, but it is not a strong standalone separator by itself.
+
+## Plot analysis: adjusted absences effect
+
+This chunk uses a logistic model to estimate the adjusted relationship between absences and the probability of being in a relationship. Its role is to move beyond raw grouped percentages and show a smoother, more interpretable pattern for one of the clearest predictors in the current results.
+
+```{r}
+# This chunk fits a logistic model to estimate the adjusted relationship between absences
+# and the probability of being in a relationship. It uses a quadratic term and plots
+# sex-specific predicted probabilities with confidence intervals.
+students_abs <- students %>%
+  mutate(abs_cap = pmin(absences, 15))   # Cap very large absence values at 15 so the far tail is not too sparse
+
+abs_vis_fit <- glm(
+  I(romantic == "yes") ~ poly(abs_cap, 2, raw = TRUE) * sex,
+  family = binomial(),
+  data = students_abs
+)
+
+abs_grid <- expand.grid(
+  abs_cap = 0:15,
+  sex = levels(students_abs$sex)
+)
+
+abs_pred <- predict(abs_vis_fit, newdata = abs_grid, type = "link", se.fit = TRUE)
+
+abs_plot_df <- abs_grid %>%
+  mutate(
+    fit_link = abs_pred$fit,
+    se_link  = abs_pred$se.fit,
+    prob  = plogis(fit_link),
+    lower = plogis(fit_link - 1.96 * se_link),
+    upper = plogis(fit_link + 1.96 * se_link)
+  )
+
+ggplot(abs_plot_df, aes(x = abs_cap, y = prob, color = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Adjusted relationship probability by absences",
+    subtitle = "Curves are based on a logistic model with a quadratic term; absences above 15 are capped",
+    x = "Absences (capped at 15)",
+    y = "Predicted probability of being in a relationship",
+    color = "Sex",
+    fill = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, the lines show the model-adjusted predicted probability of being in a relationship across absence levels, the shaded ribbons show the 95% confidence intervals, and the two colors separate females and males. The main pattern is that the predicted probability tends to rise as absences increase, especially at the higher end. For females, the increase is fairly smooth, while for males the curve is more U-shaped at first and then rises clearly at higher absence levels. This suggests that absences capture a meaningful social-behavior signal and may be more informative than the weaker family-background variables.
+
+## Plot analysis: internet access
+
+This chunk visualizes internet access as a simple and interpretable binary predictor, with labels showing the sex-specific percentage-point difference from the no-internet group. Its role is to highlight a direct opportunity/resource variable that is easier to interpret than the weaker parent-education effects.
+
+```{r}
+# This chunk compares relationship rates between students with and without internet at home.
+# It also labels the sex-specific percentage-point difference relative to the no-internet group,
+# making the result easy to interpret directly.
+internet_df <- students %>%
+  group_by(sex, internet) %>%
+  summarise(
+    prop_yes = mean(romantic == "yes"),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(sex) %>%
+  mutate(
+    base_no = prop_yes[internet == "no"],
+    diff_pp = 100 * (prop_yes - base_no)
+  ) %>%
+  ungroup()
+
+ggplot(internet_df, aes(x = internet, y = prop_yes, fill = sex)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_text(
+    aes(
+      label = if_else(
+        internet == "yes",
+        paste0(scales::percent(prop_yes, accuracy = 1), "\n", sprintf("%+.0f pp", diff_pp), "\nN=", n),
+        paste0(scales::percent(prop_yes, accuracy = 1), "\nBaseline\nN=", n)
+      )
+    ),
+    position = position_dodge(width = 0.75),
+    vjust = -0.2,
+    size = 3
+  ) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Internet access and relationship rate",
+    subtitle = "Labels show the sex-specific percentage-point difference from the no-internet group",
+    x = "Internet at home",
+    y = "Proportion in relationship (romantic = yes)",
+    fill = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, the bars show the relationship rate for students with and without internet at home, and the labels report the percentage-point change relative to the no-internet baseline within each sex. The pattern is very consistent: students with internet access are slightly more likely to report a relationship in both sexes. It is not a huge effect, but it is direct, interpretable, and more stable than the noisier parent-education patterns.
+
+## Plot analysis: grouped absences
+
+This chunk provides a simpler grouped view of absences and relationship prevalence across the full sample. Its role is mainly descriptive, while the adjusted absences plot provides the stronger interpretation.
+
+```{r}
+# This chunk provides a simpler grouped version of the absences pattern.
+# Instead of using a smooth model, it bins absences into practical ranges
+# and reports the observed relationship rate in each group.
+abs_df_all <- students %>%
+  mutate(
+    abs_group = case_when(
+      absences == 0 ~ "0",
+      absences <= 2 ~ "1-2",
+      absences <= 5 ~ "3-5",
+      absences <= 10 ~ "6-10",
+      TRUE ~ "11+"
+    ),
+    abs_group = factor(abs_group, levels = c("0", "1-2", "3-5", "6-10", "11+"))
+  ) %>%
+  group_by(abs_group) %>%
+  summarise(
+    prop_yes = mean(romantic == "yes"),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(abs_df_all, aes(x = abs_group, y = prop_yes)) +
+  geom_col() +
+  geom_text(aes(label = paste0("n=", n)), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Relationship rate by absence group (All students)",
+    x = "Absence group",
+    y = "Proportion in relationship (romantic = yes)"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, each bar shows the observed relationship rate within one absence group, and the labels above the bars show the group sample size. The lowest rate appears in the 1-2 absence group, while the 6-10 and 11+ groups are noticeably higher. This supports the earlier adjusted absences plot: the relationship is not perfectly linear, but higher absence groups do tend to be associated with higher relationship prevalence.
+
+## Plot analysis: adjusted study time effect
+
+This chunk shows the model-adjusted probability of being in a relationship across study-time levels, separately by sex. Its role is to present study time as a level-based predictor rather than forcing it into a misleading straight-line interpretation.
+
+```{r}
+# This chunk estimates the model-adjusted probability of being in a relationship
+# across study-time levels, separately by sex. It treats study time as a level-based
+# predictor rather than forcing it into a simple straight-line effect.
+study_vis_fit <- glm(
+  I(romantic == "yes") ~ factor(studytime) * sex,
+  family = binomial(),
+  data = students
+)
+
+study_grid <- expand.grid(
+  studytime = sort(unique(students$studytime)),
+  sex = levels(students$sex)
+)
+
+study_pred <- predict(study_vis_fit, newdata = study_grid, type = "link", se.fit = TRUE)
+
+study_plot_df <- study_grid %>%
+  mutate(
+    fit_link = study_pred$fit,
+    se_link  = study_pred$se.fit,
+    prob  = plogis(fit_link),
+    lower = plogis(fit_link - 1.96 * se_link),
+    upper = plogis(fit_link + 1.96 * se_link)
+  ) %>%
+  left_join(
+    students %>%
+      group_by(sex, studytime) %>%
+      summarise(n = n(), .groups = "drop"),
+    by = c("sex", "studytime")
+  )
+
+ggplot(study_plot_df, aes(x = factor(studytime), y = prob, fill = sex)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    position = position_dodge(width = 0.75),
+    width = 0.15
+  ) +
+  geom_text(
+    aes(label = paste0("N=", n)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.3,
+    size = 3
+  ) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Adjusted relationship probability by study time",
+    subtitle = "Bars show model-adjusted predicted probability; error bars show 95% CI",
+    x = "Study time level",
+    y = "Predicted probability of being in a relationship",
+    fill = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, the bars show the model-adjusted predicted probability of being in a relationship, the error bars show the 95% confidence intervals, and the labels above the bars show the sample size in each study-time group. The clearest pattern is that both females and males peak around study-time level 3, while level 4 drops sharply for both groups. In other words, moderate study time is associated with the highest relationship probability, but the most intensive study group has a clearly lower probability.
+
+## Modeling approach: preprocessing recipe
+
+This chunk defines the preprocessing pipeline used before machine-learning models are fitted. Its role is to make the predictive comparison fair by standardizing numeric variables, collapsing rare categories, removing redundant predictors, and creating dummy-coded inputs where needed.
+
+```{r}
+# This chunk defines the preprocessing pipeline for the pooled, female-only,
+# and male-only models. It removes redundant variables, collapses rare categories,
+# standardizes numeric predictors, and creates dummy-coded features for modeling.
+rec_F <- recipe(romantic ~ ., data = train_F_mod) %>%
+  step_rm(course, age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+          freetime_pct, goout_pct, studytime_pct, alc_mean_pct) %>%
+  step_other(all_nominal_predictors(), threshold = 0.03, other = "other_collapsed") %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+rec_M <- recipe(romantic ~ ., data = train_M_mod) %>%
+  step_rm(age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+          freetime_pct, goout_pct, studytime_pct, alc_mean_pct) %>%
+  step_other(all_nominal_predictors(), threshold = 0.03, other = "other_collapsed") %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+rec_all <- recipe(romantic ~ ., data = train_data_mod) %>%
+  step_rm(course, age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+          freetime_pct, goout_pct, studytime_pct, alc_mean_pct) %>%
+  step_other(all_nominal_predictors(), threshold = 0.03, other = "other_collapsed") %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+```
+
+This chunk is a preprocessing step rather than a substantive result. Its role is to make the later model comparison fair by giving all models a consistent input structure.
+
+## Baseline model: logistic regression
+
+This chunk fits logistic regression models for the pooled sample and the two sex-specific subsets. Its role is to provide an interpretable statistical baseline before comparing more flexible nonlinear models.
+
+```{r}
+# This chunk fits the baseline logistic-regression models for the pooled sample,
+# the female subgroup, and the male subgroup. These models provide
+# an interpretable benchmark before moving to more flexible machine-learning models.
+logit_spec <- logistic_reg() %>% set_engine("glm")
+
+logit_wf <- workflow() %>%
+  add_recipe(rec_all) %>%
+  add_model(logit_spec)
+logit_fit <- fit(logit_wf, data = train_data_mod)
+
+logit_wf_F <- workflow() %>%
+  add_recipe(rec_F) %>%
+  add_model(logit_spec)
+logit_fit_F <- fit(logit_wf_F, data = train_F_mod)
+
+logit_wf_M <- workflow() %>%
+  add_recipe(rec_M) %>%
+  add_model(logit_spec)
+logit_fit_M <- fit(logit_wf_M, data = train_M_mod)
+
+logit_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(p.value)
+
+logit_fit_F %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(p.value)
+
+logit_fit_M %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(p.value)
+```
+
+**Pooled logistic coefficients.** This coefficient table reports the pooled logistic baseline on the log-odds scale. The clearest signals near the top are that being male is associated with lower predicted relationship probability, while activities, internet access, and absences are associated with higher probability. The general message is that the pooled baseline already points more strongly toward sex and behavior-related variables than toward family-background variables.
+
+**Female logistic coefficients.** The female-specific logistic table has fewer clearly dominant predictors, and several effects are only modest in size. That suggests the female pattern is somewhat more diffuse, which helps explain why a nonlinear model later performs best by accuracy in this subgroup.
+
+**Male logistic coefficients.** The male-specific logistic effects look more unstable overall, with fewer clean, consistent predictors. This becomes important later, because the male models show weaker and less reliable classification behavior on the test set.
+
+## Tuned machine-learning models and ensemble construction
+
+This chunk tunes multiple predictive models, including Random Forest, Elastic Net, SVM, kNN, MLP, XGBoost, and a stacking ensemble. Its role is to test whether more flexible models improve prediction beyond the interpretable logistic baseline.
+
+```{r tuned_models}
+#| cache: true
+# This chunk tunes several machine-learning models, including Random Forest,
+# Elastic Net, SVM, kNN, MLP, XGBoost, and a stacking ensemble.
+# The goal is to compare flexible predictive models against the logistic baseline.
+metric_cls <- metric_set(accuracy, roc_auc)
+
+rf_spec_tune <- rand_forest(
+  mode  = "classification",
+  trees = tune(),
+  mtry  = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity")
+
+enet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet", maxit = 200000) %>%
+  set_mode("classification")
+
+svm_spec <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+mlp_spec <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+xgb_spec <- boost_tree(
+  trees       = tune(),
+  tree_depth  = tune(),
+  learn_rate  = tune(),
+  mtry        = tune(),
+  min_n       = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost", verbosity = 0) %>%
+  set_mode("classification")
+
+tree_spec_tune <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth      = tune(),
+  min_n           = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+get_n_pred <- function(train_df, rec_obj) {
+  rec_obj %>%
+    prep(training = train_df, retain = TRUE) %>%
+    juice() %>%
+    dplyr::select(-romantic) %>%
+    ncol()
+}
+
+best_mean_metric <- function(res_obj, metric_name) {
+  out <- tryCatch(
+    show_best(res_obj, metric = metric_name, n = 1) %>% dplyr::pull(mean),
+    error = function(e) NA_real_
+  )
+  out[1]
+}
+
+fit_one_group_ensemble <- function(train_df, rec_obj, v = 10,
+                                   acc_cut = 0.70,
+                                   bayes_iter = 20) {
+
+  set.seed(123)
+  folds <- vfold_cv(train_df, v = v, strata = romantic)
+
+  ctrl_grid_stack <- tune::control_grid(
+    save_pred = TRUE,
+    save_workflow = TRUE,
+    event_level = "second",
+    parallel_over = "resamples"
+  )
+
+  ctrl_bayes_stack <- tune::control_bayes(
+    save_pred = TRUE,
+    save_workflow = TRUE,
+    event_level = "second",
+    no_improve = 8,
+    verbose = FALSE,
+    parallel_over = "resamples"
+  )
+
+  ctrl_race_stack <- finetune::control_race(
+    save_pred = TRUE,
+    save_workflow = TRUE,
+    event_level = "second",
+    burn_in = 3,
+    num_ties = 10,
+    verbose_elim = FALSE,
+    parallel_over = "resamples"
+  )
+
+  rf_wf   <- workflow() %>% add_recipe(rec_obj) %>% add_model(rf_spec_tune)
+  enet_wf <- workflow() %>% add_recipe(rec_obj) %>% add_model(enet_spec)
+  svm_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(svm_spec)
+  knn_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(knn_spec)
+  mlp_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(mlp_spec)
+  xgb_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(xgb_spec)
+  tree_wf <- workflow() %>% add_recipe(rec_obj) %>% add_model(tree_spec_tune)
+
+  n_pred <- get_n_pred(train_df, rec_obj)
+
+  rf_params <- hardhat::extract_parameter_set_dials(rf_spec_tune) %>%
+    update(
+      trees = dials::trees(c(500, 2000)),
+      mtry  = dials::mtry(c(2, n_pred)),
+      min_n = dials::min_n(c(2, 30))
+    )
+  rf_grid <- dials::grid_space_filling(rf_params, size = 25)
+
+  knn_params <- hardhat::extract_parameter_set_dials(knn_spec) %>%
+    update(neighbors = dials::neighbors(c(3, 80)))
+  knn_grid <- dials::grid_space_filling(knn_params, size = 25)
+
+  tree_params <- hardhat::extract_parameter_set_dials(tree_spec_tune) %>%
+    update(
+      tree_depth      = dials::tree_depth(c(1, 12)),
+      min_n           = dials::min_n(c(2, 40)),
+      cost_complexity = dials::cost_complexity(c(-5, -1))
+    )
+  tree_grid <- dials::grid_space_filling(tree_params, size = 25)
+
+  enet_params <- hardhat::extract_parameter_set_dials(enet_spec)
+  enet_grid <- dials::grid_space_filling(enet_params, size = 12)
+
+  svm_params <- hardhat::extract_parameter_set_dials(svm_spec)
+  svm_grid  <- dials::grid_space_filling(svm_params, size = 15)
+
+  mlp_params <- hardhat::extract_parameter_set_dials(mlp_spec)
+  mlp_grid <- dials::grid_space_filling(mlp_params, size = 15)
+
+  xgb_params <- hardhat::extract_parameter_set_dials(xgb_spec) %>%
+    update(
+      mtry        = dials::mtry(c(2, n_pred)),
+      trees       = dials::trees(c(300, 2000)),
+      tree_depth  = dials::tree_depth(c(2, 10)),
+      min_n       = dials::min_n(c(2, 30)),
+      learn_rate  = dials::learn_rate(c(-4, -1)),
+      sample_size = dials::sample_prop(c(0.5, 1.0))
+    )
+  xgb_grid <- dials::grid_space_filling(xgb_params, size = 15)
+
+  bayes_refine <- function(wf_obj, param_info, init_grid, resamples, iter = 20) {
+    set.seed(123)
+    init_res <- tune_grid(
+      wf_obj,
+      resamples = resamples,
+      grid = init_grid,
+      param_info = param_info,
+      metrics = metric_cls,
+      control = ctrl_grid_stack
+    )
+
+    set.seed(123)
+    tune_bayes(
+      wf_obj,
+      resamples = resamples,
+      initial = init_res,
+      iter = iter,
+      param_info = param_info,
+      metrics = metric_cls,
+      control = ctrl_bayes_stack
+    )
+  }
+
+  set.seed(123)
+  rf_res <- finetune::tune_race_anova(
+    rf_wf,
+    resamples = folds,
+    grid = rf_grid,
+    metrics = metric_cls,
+    control = ctrl_race_stack
+  )
+
+  set.seed(123)
+  knn_res <- finetune::tune_race_anova(
+    knn_wf,
+    resamples = folds,
+    grid = knn_grid,
+    metrics = metric_cls,
+    control = ctrl_race_stack
+  )
+
+  set.seed(123)
+  tree_res <- finetune::tune_race_anova(
+    tree_wf,
+    resamples = folds,
+    grid = tree_grid,
+    metrics = metric_cls,
+    control = ctrl_race_stack
+  )
+
+  enet_res <- bayes_refine(enet_wf, enet_params, enet_grid, folds, iter = bayes_iter)
+  svm_res  <- bayes_refine(svm_wf,  svm_params,  svm_grid,  folds, iter = bayes_iter)
+  mlp_res  <- bayes_refine(mlp_wf,  mlp_params,  mlp_grid,  folds, iter = bayes_iter)
+  xgb_res  <- bayes_refine(xgb_wf,  xgb_params,  xgb_grid,  folds, iter = bayes_iter)
+
+ family_tbl <- tibble(
+  family = c("rf", "knn", "xgb", "mlp", "svm", "tree", "enet"),
+  auc = c(
+    best_mean_metric(rf_res, "roc_auc"),
+    best_mean_metric(knn_res, "roc_auc"),
+    best_mean_metric(xgb_res, "roc_auc"),
+    best_mean_metric(mlp_res, "roc_auc"),
+    best_mean_metric(svm_res, "roc_auc"),
+    best_mean_metric(tree_res, "roc_auc"),
+    best_mean_metric(enet_res, "roc_auc")
+  ),
+  acc = c(
+    best_mean_metric(rf_res, "accuracy"),
+    best_mean_metric(knn_res, "accuracy"),
+    best_mean_metric(xgb_res, "accuracy"),
+    best_mean_metric(mlp_res, "accuracy"),
+    best_mean_metric(svm_res, "accuracy"),
+    best_mean_metric(tree_res, "accuracy"),
+    best_mean_metric(enet_res, "accuracy")
+  )
+) %>%
+  arrange(desc(acc), desc(auc))
+
+families_keep <- family_tbl %>%
+  filter(acc >= acc_cut) %>%
+  pull(family)
+
+  if (length(families_keep) < 3) {
+    families_keep <- family_tbl %>%
+      slice_head(n = 3) %>%
+      pull(family)
+  }
+
+  stack_obj <- stacks()
+
+  if ("rf"   %in% families_keep) stack_obj <- stack_obj %>% add_candidates(rf_res)
+  if ("knn"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(knn_res)
+  if ("xgb"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(xgb_res)
+  if ("mlp"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(mlp_res)
+  if ("svm"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(svm_res)
+  if ("tree" %in% families_keep) stack_obj <- stack_obj %>% add_candidates(tree_res)
+  if ("enet" %in% families_keep) stack_obj <- stack_obj %>% add_candidates(enet_res)
+
+stack_fit <- stack_obj %>%
+  blend_predictions(
+    penalty = 10^seq(-6, -1, length.out = 40),
+    metric = metric_set(accuracy)
+  ) %>%
+  fit_members()
+
+  fit_best <- function(wf_obj, res_obj, train_df_inner) {
+  best_params <- tune::select_best(res_obj, metric = "accuracy")
+  wf_final <- tune::finalize_workflow(wf_obj, best_params)
+  fit(wf_final, data = train_df_inner)
+}
+
+  list(
+    folds = folds,
+    family_tbl = family_tbl,
+    families_keep = families_keep,
+
+    rf_best   = tune::select_best(rf_res,   metric = "accuracy"),
+knn_best  = tune::select_best(knn_res,  metric = "accuracy"),
+xgb_best  = tune::select_best(xgb_res,  metric = "accuracy"),
+tree_best = tune::select_best(tree_res, metric = "accuracy"),
+
+    rf_fit   = fit_best(rf_wf,   rf_res,   train_df),
+    enet_fit = fit_best(enet_wf, enet_res, train_df),
+    svm_fit  = fit_best(svm_wf,  svm_res,  train_df),
+    knn_fit  = fit_best(knn_wf,  knn_res,  train_df),
+    mlp_fit  = fit_best(mlp_wf,  mlp_res,  train_df),
+    xgb_fit  = fit_best(xgb_wf,  xgb_res,  train_df),
+    tree_fit = fit_best(tree_wf, tree_res, train_df),
+
+    stack_fit = stack_fit,
+
+    rf_res   = rf_res,
+    knn_res  = knn_res,
+    xgb_res  = xgb_res,
+    tree_res = tree_res,
+    svm_res  = svm_res,
+    enet_res = enet_res,
+    mlp_res  = mlp_res
+  )
+}
+
+ens_all <- fit_one_group_ensemble(train_data_mod, rec_all, v = 10, acc_cut = 0.72, bayes_iter = 20)
+ens_F   <- fit_one_group_ensemble(train_F_mod,   rec_F,   v = 10, acc_cut = 0.70, bayes_iter = 20)
+ens_M   <- fit_one_group_ensemble(train_M_mod,   rec_M,   v = 10, acc_cut = 0.72, bayes_iter = 20)
+
+rf_fit       <- ens_all$rf_fit
+rf_fit_F     <- ens_F$rf_fit
+rf_fit_M     <- ens_M$rf_fit
+
+enet_fit     <- ens_all$enet_fit
+svm_fit      <- ens_all$svm_fit
+knn_fit      <- ens_all$knn_fit
+mlp_fit      <- ens_all$mlp_fit
+xgb_fit      <- ens_all$xgb_fit
+tree_fit     <- ens_all$tree_fit
+
+enet_fit_F   <- ens_F$enet_fit
+svm_fit_F    <- ens_F$svm_fit
+knn_fit_F    <- ens_F$knn_fit
+mlp_fit_F    <- ens_F$mlp_fit
+xgb_fit_F    <- ens_F$xgb_fit
+tree_fit_F   <- ens_F$tree_fit
+
+enet_fit_M   <- ens_M$enet_fit
+svm_fit_M    <- ens_M$svm_fit
+knn_fit_M    <- ens_M$knn_fit
+mlp_fit_M    <- ens_M$mlp_fit
+xgb_fit_M    <- ens_M$xgb_fit
+tree_fit_M   <- ens_M$tree_fit
+
+stack_fit_all <- ens_all$stack_fit
+stack_fit_F   <- ens_F$stack_fit
+stack_fit_M   <- ens_M$stack_fit
+
+ens_all$family_tbl
+ens_all$families_keep
+ens_all$rf_best
+ens_all$knn_best
+ens_all$xgb_best
+ens_all$tree_best
+```
+
+**Cross-validated model-family ranking.** This output summarizes the pooled cross-validated performance of the main model families before final test-set evaluation. In the current version, the stronger flexible candidates are concentrated among XGBoost, Random Forest, and SVM, while the simpler tree-based options are weaker. The tuning stage is already pointing toward a small set of model families that deserve the most attention.
+
+**Families kept for stacking and best hyperparameters.** These outputs show which model families were retained for the ensemble and what the selected tuning values look like. In practical terms, the tuning stage is favoring smoother and more stable decision rules rather than extremely aggressive fits.
+
+## Model performance comparison
+
+This chunk compares all candidate models on the held-out test set. Its role in the paper is to determine which models perform best in the pooled sample and in the female and male subgroups, using Accuracy, F1, and AUC together rather than relying on a single metric.
+
+```{r}
+# This chunk evaluates all candidate models on the held-out test set.
+# It selects a threshold on the training data, applies that threshold to the test data,
+# and compares models using Accuracy, F1, and AUC together.
+best_threshold <- function(truth, prob,
+                           optimize_for = c("accuracy", "f1"),
+                           grid = seq(0.05, 0.95, by = 0.01)) {
+  optimize_for <- match.arg(optimize_for)
+  truth <- factor(truth, levels = c("no", "yes"))
+
+  tibble(threshold = grid) %>%
+    mutate(
+      score = purrr::map_dbl(threshold, function(t) {
+        pred <- factor(dplyr::if_else(prob >= t, "yes", "no"),
+                       levels = c("no", "yes"))
+        if (optimize_for == "accuracy") {
+          yardstick::accuracy_vec(truth, pred)
+        } else {
+          yardstick::f_meas_vec(truth, pred, event_level = "second")
+        }
+      })
+    ) %>%
+    slice_max(score, n = 1, with_ties = FALSE)
+}
+
+eval_with_train_threshold <- function(train_truth, train_prob, test_truth, test_prob,
+                                      optimize_for = "accuracy") {
+  thr <- best_threshold(train_truth, train_prob,
+                        optimize_for = optimize_for)$threshold[[1]]
+
+  test_truth <- factor(test_truth, levels = c("no", "yes"))
+  test_class <- factor(dplyr::if_else(test_prob >= thr, "yes", "no"),
+                       levels = c("no", "yes"))
+
+  tibble(
+    Accuracy  = yardstick::accuracy_vec(test_truth, test_class),
+    F1_Score  = yardstick::f_meas_vec(test_truth, test_class, event_level = "second"),
+    AUC       = yardstick::roc_auc_vec(test_truth, test_prob, event_level = "second"),
+    Threshold = thr,
+    OptimizeFor = optimize_for
+  )
+}
+
+get_prob_yes <- function(fit_obj, new_df, fallback_fit = NULL) {
+  if (inherits(fit_obj, "model_stack")) {
+    prob_tbl <- tryCatch(
+      predict(fit_obj, new_data = new_df, type = "prob"),
+      error = function(e) NULL
+    )
+
+    if (is.null(prob_tbl) || !".pred_yes" %in% names(prob_tbl)) {
+      if (is.null(fallback_fit)) {
+        stop("Stacking ensemble retained no usable members; please provide a fallback_fit.")
+      }
+      return(predict(fallback_fit, new_data = new_df, type = "prob")$.pred_yes)
+    }
+
+    return(prob_tbl$.pred_yes)
+  }
+
+  predict(fit_obj, new_data = new_df, type = "prob")$.pred_yes
+}
+
+eval_model <- function(name, fit_obj, train_df, test_df,
+                       optimize_for = "accuracy",
+                       fallback_fit = NULL) {
+  train_prob <- get_prob_yes(fit_obj, train_df, fallback_fit = fallback_fit)
+  test_prob  <- get_prob_yes(fit_obj, test_df,  fallback_fit = fallback_fit)
+
+  eval_with_train_threshold(
+    train_df$romantic, train_prob,
+    test_df$romantic,  test_prob,
+    optimize_for = optimize_for
+  ) %>%
+    mutate(Model = name) %>%
+    dplyr::select(Model, Accuracy, F1_Score, AUC, Threshold, OptimizeFor)
+}
+eval_avg_prob <- function(name, fit_list, train_df, test_df, optimize_for = "accuracy") {
+  train_prob_mat <- sapply(fit_list, function(fit) get_prob_yes(fit, train_df))
+  test_prob_mat  <- sapply(fit_list, function(fit) get_prob_yes(fit, test_df))
+
+  train_prob <- rowMeans(train_prob_mat)
+  test_prob  <- rowMeans(test_prob_mat)
+
+  eval_with_train_threshold(
+    train_df$romantic, train_prob,
+    test_df$romantic,  test_prob,
+    optimize_for = optimize_for
+  ) %>%
+    mutate(Model = name) %>%
+    dplyr::select(Model, Accuracy, F1_Score, AUC, Threshold, OptimizeFor)
+}
+
+single_model_names <- c(
+  "Logistic (baseline)",
+  "Random Forest (tuned)",
+  "Decision Tree (tuned)",
+  "Elastic Net",
+  "SVM RBF",
+  "kNN",
+  "Neural Net (MLP)",
+  "XGBoost"
+)
+
+results_all <- bind_rows(
+  eval_model("Logistic (baseline)", logit_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Random Forest (tuned)", rf_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Decision Tree (tuned)", tree_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Elastic Net", enet_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("SVM RBF", svm_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("kNN", knn_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Neural Net (MLP)", mlp_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("XGBoost", xgb_fit, train_data_mod, test_data_mod, optimize_for = "accuracy")
+)
+
+results_F <- bind_rows(
+  eval_model("Logistic (baseline)", logit_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("Decision Tree (tuned)", tree_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("Random Forest (tuned)", rf_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("Elastic Net", enet_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("SVM RBF", svm_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("kNN", knn_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("Neural Net (MLP)", mlp_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("XGBoost", xgb_fit_F, train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_avg_prob("Avg Prob (RF+XGB+MLP)", list(rf_fit_F, xgb_fit_F, mlp_fit_F),
+                train_F_mod, test_F_mod, optimize_for = "accuracy"),
+  eval_model("Stacking Ensemble", stack_fit_F, train_F_mod, test_F_mod,
+           optimize_for = "accuracy", fallback_fit = rf_fit_F)
+)
+
+results_M <- bind_rows(
+  eval_model("Logistic (baseline)", logit_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("Decision Tree (tuned)", tree_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("Random Forest (tuned)", rf_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("Elastic Net", enet_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("SVM RBF", svm_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("kNN", knn_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("Neural Net (MLP)", mlp_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("XGBoost", xgb_fit_M, train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_avg_prob("Avg Prob (kNN+RF+XGB)", list(knn_fit_M, rf_fit_M, xgb_fit_M),
+                train_M_mod, test_M_mod, optimize_for = "accuracy"),
+  eval_model("Stacking Ensemble", stack_fit_M, train_M_mod, test_M_mod,
+           optimize_for = "accuracy", fallback_fit = knn_fit_M)
+)
+
+results_all
+results_F
+results_M
+```
+
+**Pooled test-set results.** This table shows the held-out test performance for the pooled sample. The strongest single model by accuracy is Random Forest, which is better than the logistic baseline and slightly ahead of the other nonlinear candidates. Overall, the pooled sample benefits from a more flexible model, but the improvement is moderate rather than dramatic.
+
+**Female test-set results.** The female subgroup is the clearest subgroup success in the project. SVM RBF emerges as the strongest single model by accuracy, while the ensemble-style approaches also show respectable ranking performance. In other words, the female subgroup is the setting where the predictive signal is most usable.
+
+**Male test-set results.** The male subgroup is the weakest part of the current Final version, but it is important to place this result in the context of earlier project stages. In earlier versions, the male subgroup was often one of the strongest-performing parts of the project rather than the weakest one. In particular, before the stricter student-level sample reconstruction, an earlier kNN model for males reached an extremely high result, with accuracy around 0.95, F1 around 0.93, and AUC around 0.96. Even after the sample was made more conservative in E6, the male subgroup still achieved the best subgroup-level test accuracy at about 0.735, which means the current decline is not evidence that the male data contain no predictive signal. Instead, the drop from E6 to Final likely reflects a stricter and more compressed data construction. Compared with last version, Final merges overlapping students into a single student-level row, which reduces the sample further and may smooth out course-specific or local behavioral patterns that previously helped male classification. This matters especially for male models because that subgroup is smaller and appears more sensitive to modeling choices. In the current Final version results, Elastic Net reaches the top male accuracy value, but several male models have F1 values of 0 or missing, which suggests that the present accuracy-first thresholding strategy has become too conservative for recovering positive cases. So the current male weakness should be interpreted as a consequence of stricter sample construction and threshold behavior, rather than as evidence that the male subgroup was always hard to predict. This also motivates the probability-based evaluation later in the paper, because the male top-accuracy model is not the same as the male best-AUC model.
+
+## Main model comparison results
+
+This section summarizes the strongest single models by test accuracy. Because the exact values may change after preprocessing or tuning updates, the summary below is generated directly from the current result tables.
+
+```{r}
+# This chunk identifies the strongest single model in the pooled, female, and male results tables
+# and then prints a short dynamically generated summary of the current version.
+#| echo: false
+#| results: asis
+
+best_all_single <- results_all %>%
+  filter(Model %in% single_model_names) %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+best_F_single <- results_F %>%
+  filter(Model %in% single_model_names) %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+best_M_single <- results_M %>%
+  filter(Model %in% single_model_names) %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+summary_text <- glue::glue(
+"
+In the pooled sample, the best single model by test Accuracy is **{best_all_single$Model[[1]]}**, with Accuracy = {round(best_all_single$Accuracy[[1]], 3)}, F1 = {round(best_all_single$F1_Score[[1]], 3)}, and AUC = {round(best_all_single$AUC[[1]], 3)}.
+
+In the female subgroup, the best single model by test Accuracy is **{best_F_single$Model[[1]]}**, with Accuracy = {round(best_F_single$Accuracy[[1]], 3)}, F1 = {round(best_F_single$F1_Score[[1]], 3)}, and AUC = {round(best_F_single$AUC[[1]], 3)}.
+
+In the male subgroup, the best single model by test Accuracy is **{best_M_single$Model[[1]]}**, with Accuracy = {round(best_M_single$Accuracy[[1]], 3)}, F1 = {round(best_M_single$F1_Score[[1]], 3)}, and AUC = {round(best_M_single$AUC[[1]], 3)}.
+
+Taken together, the current version is now accuracy-first: it keeps sex in the pooled model, merges overlapping students at the student level, selects tuned hyperparameters by Accuracy, and reports the strongest single classifier in the pooled sample rather than prioritizing pooled ensemble models.
+"
+)
+
+cat(summary_text)
+```
+
+**Interpretation.** Taken together, the current version now has a clear main story: the pooled sample and the female subgroup produce usable predictive patterns, while the male subgroup remains the weakest and least reliable part of the framework. The male top-accuracy result should therefore be read with caution rather than treated as a strong modeling success.
+
+```{r}
+## Model interpretation: global variable importance
+
+# This chunk visualizes the most important predictors used by the pooled Random Forest model.
+# Larger values mean that the model relied more heavily on that variable when making decisions.
+# The goal is to identify which predictors contribute most strongly to relationship classification.
+
+rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vip(num_features = 15) +
+  labs(
+    title = "Random Forest variable importance (pooled sample)",
+    x = "Importance",
+    y = NULL
+  ) +
+  theme_minimal()
+
+# This chunk does the same for the pooled XGBoost model.
+# It helps compare whether the boosting model highlights a similar or different predictor ranking.
+
+xgb_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vip(num_features = 15) +
+  labs(
+    title = "XGBoost variable importance (pooled sample)",
+    x = "Importance",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+**Random Forest importance.** For this plot, the longer bars mean the Random Forest relied more heavily on that variable when making predictions. The most important pooled predictor is absences, followed by academic performance variables such as G3, G2, and G1. After that, the model still uses alcohol, sex, family relationship quality, free time, going out, and study time, but the parent-education variables are clearly lower in the ranking. This tells us that the strongest pooled predictive signal is coming more from behavior and school-life variables than from family background.
+
+**XGBoost importance.** The XGBoost importance ranking tells a similar overall story, but it puts even more weight on sex while still ranking absences very highly. It also gives notable attention to activities, school, and study time. So the boosting model is not telling a completely different story, but it does emphasize sex and context variables more strongly than the Random Forest does.
+
+```{r}
+
+### 4C. Add direction to tree-based importance: response profile plots
+
+## Model interpretation: response profile plots
+
+# This helper function builds a profile plot for a numeric predictor.
+# It replaces one variable with a sequence of values while keeping the rest of the data unchanged.
+# The plot shows how the average predicted probability of romantic = yes changes across that predictor.
+
+plot_numeric_profile <- function(fit_obj, data, var, grid = NULL) {
+  feature_data <- dplyr::select(data, -romantic)
+
+  if (is.null(grid)) {
+    rng <- range(feature_data[[var]], na.rm = TRUE)
+    grid <- seq(rng[1], rng[2], length.out = 25)
+  }
+
+  profile_df <- purrr::map_dfr(grid, function(val) {
+    new_data <- feature_data
+    new_data[[var]] <- val
+
+    tibble(
+      value = val,
+      prob_yes = mean(
+        predict(fit_obj, new_data = new_data, type = "prob")$.pred_yes,
+        na.rm = TRUE
+      )
+    )
+  })
+
+  ggplot(profile_df, aes(x = value, y = prob_yes)) +
+    geom_line(linewidth = 1.2) +
+    scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    labs(
+      title = paste("Response profile for", var),
+      x = var,
+      y = "Average predicted probability of romantic = yes"
+    ) +
+    theme_minimal()
+}
+
+# This helper function builds a profile plot for a categorical predictor.
+# It replaces one factor with each of its levels and compares the average predicted probability.
+
+plot_factor_profile <- function(fit_obj, data, var) {
+  feature_data <- dplyr::select(data, -romantic)
+  levs <- levels(feature_data[[var]])
+
+  profile_df <- purrr::map_dfr(levs, function(val) {
+    new_data <- feature_data
+    new_data[[var]] <- factor(val, levels = levs)
+
+    tibble(
+      level = val,
+      prob_yes = mean(
+        predict(fit_obj, new_data = new_data, type = "prob")$.pred_yes,
+        na.rm = TRUE
+      )
+    )
+  })
+
+  ggplot(profile_df, aes(x = level, y = prob_yes)) +
+    geom_col() +
+    scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    labs(
+      title = paste("Response profile for", var),
+      x = var,
+      y = "Average predicted probability of romantic = yes"
+    ) +
+    theme_minimal()
+}
+```
+
+This chunk defines helper functions for response-profile plots. It does not produce a substantive result by itself, but it sets up the next figures that give direction to the variable-importance rankings.
+
+```{r}
+
+# This chunk visualizes how the Random Forest prediction changes across several key predictors.
+# These plots are useful because they add directional interpretation to the earlier importance rankings.
+
+plot_numeric_profile(rf_fit, train_data_mod, "absences")
+plot_numeric_profile(rf_fit, train_data_mod, "goout")
+plot_numeric_profile(rf_fit, train_data_mod, "studytime")
+plot_factor_profile(rf_fit, train_data_mod, "internet")
+plot_factor_profile(rf_fit, train_data_mod, "activities")
+```
+
+**Response profile for absences.** For this plot, the line shows how the Random Forest average predicted probability changes when absences move across their observed range. The pattern rises from the high-30% range to about 50% and then levels off. This means the model treats larger absence values as increasingly compatible with being in a relationship, although the increase is not perfectly linear.
+
+**Response profile for goout.** The goout curve is almost flat, with only a very small rise at the high end. That means going out does matter a little, but once the rest of the predictors are already in the model, it is not producing a dramatic independent shift in prediction.
+
+**Response profile for studytime.** The study-time profile is mostly flat, but there is a small bump in the middle levels and then a drop again at the highest level. This is consistent with the earlier adjusted study-time figure: moderate study time looks somewhat more compatible with being in a relationship than the most extreme study level.
+
+**Response profile for internet.** In the internet profile, the `yes` bar is slightly above the `no` bar, which means the model sees internet access as a positive but modest predictor. This matches the earlier descriptive bar chart and reinforces that internet is a stable, interpretable signal rather than a dramatic one.
+
+**Response profile for activities.** For activities, the `yes` bar is also slightly higher than the `no` bar, so the model reads extracurricular participation as a modest positive signal for relationship status. The effect is not huge, but it is directionally consistent with the logistic baseline.
+
+## ROC curve comparison
+
+This chunk plots ROC curves for the strongest available models in the female and male subgroups. Its role is to compare ranking performance visually, while safely skipping stacking curves if a subgroup-specific stacking ensemble does not retain usable members.
+
+```{r}
+# This chunk compares the ranking performance of the strongest available models
+# in the female and male subgroups using ROC curves. It is useful because it shows
+# discrimination quality across thresholds rather than focusing on one threshold only.
+get_roc_df <- function(truth, prob, model_name, sex_label) {
+  yardstick::roc_curve(
+    tibble(truth = truth, prob = prob),
+    truth, prob,
+    event_level = "second"
+  ) %>%
+    dplyr::mutate(Model = model_name, Sex = sex_label)
+}
+
+safe_stack_prob <- function(stack_fit, new_df) {
+  prob_tbl <- tryCatch(
+    predict(stack_fit, new_data = new_df, type = "prob"),
+    error = function(e) NULL
+  )
+
+  if (is.null(prob_tbl) || !".pred_yes" %in% names(prob_tbl)) {
+    return(NULL)
+  }
+
+  prob_tbl$.pred_yes
+}
+
+# ----- Female -----
+pred_F_logit <- predict(logit_fit_F, test_F_mod, type = "prob")$.pred_yes
+pred_F_rf    <- predict(rf_fit_F,    test_F_mod, type = "prob")$.pred_yes
+pred_F_svm   <- predict(svm_fit_F,   test_F_mod, type = "prob")$.pred_yes
+pred_F_xgb   <- predict(xgb_fit_F,   test_F_mod, type = "prob")$.pred_yes
+pred_F_stack <- safe_stack_prob(stack_fit_F, test_F_mod)
+
+roc_F_list <- list(
+  get_roc_df(test_F_mod$romantic, pred_F_logit, "Logistic (baseline)", "F"),
+  get_roc_df(test_F_mod$romantic, pred_F_rf,    "Random Forest (tuned)", "F"),
+  get_roc_df(test_F_mod$romantic, pred_F_svm,   "SVM RBF", "F"),
+  get_roc_df(test_F_mod$romantic, pred_F_xgb,   "XGBoost", "F")
+)
+
+if (!is.null(pred_F_stack)) {
+  roc_F_list <- append(
+    roc_F_list,
+    list(get_roc_df(test_F_mod$romantic, pred_F_stack, "Stacking", "F"))
+  )
+}
+
+roc_F <- dplyr::bind_rows(roc_F_list)
+
+# ----- Male -----
+pred_M_logit <- predict(logit_fit_M, test_M_mod, type = "prob")$.pred_yes
+pred_M_rf    <- predict(rf_fit_M,    test_M_mod, type = "prob")$.pred_yes
+pred_M_svm   <- predict(svm_fit_M,   test_M_mod, type = "prob")$.pred_yes
+pred_M_xgb   <- predict(xgb_fit_M,   test_M_mod, type = "prob")$.pred_yes
+pred_M_stack <- safe_stack_prob(stack_fit_M, test_M_mod)
+
+roc_M_list <- list(
+  get_roc_df(test_M_mod$romantic, pred_M_logit, "Logistic (baseline)", "M"),
+  get_roc_df(test_M_mod$romantic, pred_M_rf,    "Random Forest (tuned)", "M"),
+  get_roc_df(test_M_mod$romantic, pred_M_svm,   "SVM RBF", "M"),
+  get_roc_df(test_M_mod$romantic, pred_M_xgb,   "XGBoost", "M")
+)
+
+if (!is.null(pred_M_stack)) {
+  roc_M_list <- append(
+    roc_M_list,
+    list(get_roc_df(test_M_mod$romantic, pred_M_stack, "Stacking", "M"))
+  )
+}
+
+roc_M <- dplyr::bind_rows(roc_M_list)
+
+roc_all <- dplyr::bind_rows(roc_F, roc_M)
+
+ggplot(roc_all, aes(x = 1 - specificity, y = sensitivity, color = Model)) +
+  geom_path(linewidth = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  facet_wrap(~ Sex) +
+  labs(
+    title = "ROC Curves by Sex (Available top models)",
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    color = "Model"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, curves that stay farther above the diagonal reference line indicate better ranking performance. In the female panel, the curves sit noticeably above the diagonal, which means the models are doing a reasonable job separating positive and negative cases. In the male panel, the curves are much closer to the diagonal overall, which means discrimination is substantially weaker. So the ROC comparison supports the same conclusion as the test metrics: the female subgroup is more learnable, while the male subgroup remains much harder to classify well.
+
+## Odds-ratio summary of selected predictors
+
+This chunk summarizes the direction and approximate strength of several key predictors from the logistic model. Its role is to connect the predictive analysis back to interpretable psychological and behavioral variables.
+
+```{r}
+# This chunk converts several selected pooled logistic coefficients into odds ratios
+# with confidence intervals. It gives an easier-to-read summary of direction and
+# approximate effect size for a few interpretable predictors.
+or_df <- logit_fit %>%
+  extract_fit_parsnip() %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term %in% c("absences", "studytime", "internet_yes", "Medu_pct", "Fedu_pct")) %>%
+  mutate(
+    term = recode(
+      term,
+      absences = "Absences",
+      studytime = "Study time",
+      internet_yes = "Internet = yes",
+      Medu_pct = "Mother education (%)",
+      Fedu_pct = "Father education (%)"
+    ),
+    OR = exp(estimate),
+    OR_low = exp(conf.low),
+    OR_high = exp(conf.high)
+  )
+
+ggplot(or_df, aes(x = OR, y = reorder(term, OR))) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = OR_low, xmax = OR_high), height = 0.15) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Odds-ratio summary of selected predictors",
+    x = "Odds ratio",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** For this plot, each dot shows the estimated odds ratio for one predictor, and the horizontal line shows its confidence interval. Values above 1 mean the predictor is associated with higher odds of being in a relationship, while values below 1 mean lower odds. Internet access has the strongest positive odds ratio among these selected variables, and absences are also above 1. Study time and mother education are closer to 1, while father education is slightly below 1. So, among these interpretable pooled predictors, internet and absences look like the clearest positive signals.
+
+## Descriptive summary of key group differences
+
+This final chunk compares average behavioral and family-background features across sex and relationship-status groups. Its role is to reconnect the predictive results to more interpretable group-level patterns at the end of the paper.
+
+```{r}
+# This chunk summarizes average behavioral and family-background features
+# across sex and relationship-status groups. It reconnects the predictive results
+# to simple group-level patterns that are easier to read directly.
+students %>%
+  group_by(sex, romantic) %>%
+  summarise(
+    freetime_pct  = mean(freetime_pct, na.rm = TRUE),
+    goout_pct     = mean(goout_pct, na.rm = TRUE),
+    studytime_pct = mean(studytime_pct, na.rm = TRUE),
+    alc_mean_pct  = mean(alc_mean_pct, na.rm = TRUE),
+    Medu_pct = mean(Medu_pct, na.rm = TRUE),
+Fedu_pct = mean(Fedu_pct, na.rm = TRUE),
+edu_gap_pct = mean(edu_gap_pct, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+**Interpretation.** This table shows that the clearest differences are between sexes rather than between relationship groups within the same sex. Male students report more free time, more going out, and much higher alcohol levels than female students, while female students report much higher study time on average. Within sex, the relationship and non-relationship groups are often closer together, especially for the parent-education measures. This is consistent with the modeling results: behavior and sex-related structure seem stronger than simple family-background differences.
+
+## Best-model predictions: pooled sample
+
+This chunk reports the test-set predictions from the strongest pooled-sample single model under the current accuracy-first results. The best model is selected automatically from `results_all`.
+
+```{r}
+# This chunk retrieves the strongest pooled-sample single model,
+# applies it to the held-out test set, and then shows both example predictions
+# and the confusion matrix after thresholding.
+fit_lookup_all <- setNames(
+  list(logit_fit, rf_fit, tree_fit, enet_fit, svm_fit, knn_fit, mlp_fit, xgb_fit),
+  single_model_names
+)
+
+best_all_single <- results_all %>%
+  filter(Model %in% single_model_names) %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+best_model_name_all <- best_all_single$Model[[1]]
+thr_all_best <- best_all_single$Threshold[[1]]
+fit_all_best <- fit_lookup_all[[best_model_name_all]]
+
+pred_all_best <- tibble(
+  truth = test_data_mod$romantic,
+  prob_yes = get_prob_yes(fit_all_best, test_data_mod)
+) %>%
+  mutate(
+    pred_class = factor(
+      if_else(prob_yes >= thr_all_best, "yes", "no"),
+      levels = c("no", "yes")
+    )
+  )
+
+cm_all_best <- yardstick::conf_mat(pred_all_best, truth = truth, estimate = pred_class)
+
+pred_all_best %>% slice_head(n = 10)
+cm_all_best
+```
+
+This output makes the pooled prediction process concrete. The first table shows the actual class (`truth`), the predicted probability of being in a relationship (`prob_yes`), and the final predicted class (`pred_class`) after applying the selected threshold. The confusion matrix then shows that the pooled best model is reasonably balanced overall, but it is still somewhat more likely to miss a true `yes` case than to over-predict one. In other words, the pooled classifier is useful, but it is not a perfect separator.
+
+## Best-model predictions: female subgroup
+
+This chunk reports the test-set predictions from the strongest single-model classifier in the female subgroup. The best model is selected automatically from `results_F` by test accuracy.
+
+```{r}
+# This chunk retrieves the strongest female subgroup model,
+# generates held-out predictions, and then summarizes the result
+# with both an example prediction table and a confusion matrix.
+fit_lookup_F <- setNames(
+  list(logit_fit_F, rf_fit_F, tree_fit_F, enet_fit_F, svm_fit_F, knn_fit_F, mlp_fit_F, xgb_fit_F),
+  single_model_names
+)
+
+best_F_single <- results_F %>%
+  filter(Model %in% single_model_names) %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+best_model_name_F <- best_F_single$Model[[1]]
+thr_F_best <- best_F_single$Threshold[[1]]
+fit_F_best <- fit_lookup_F[[best_model_name_F]]
+
+pred_F_best <- tibble(
+  truth = test_F_mod$romantic,
+  prob_yes = get_prob_yes(fit_F_best, test_F_mod)
+) %>%
+  mutate(
+    pred_class = factor(
+      if_else(prob_yes >= thr_F_best, "yes", "no"),
+      levels = c("no", "yes")
+    )
+  )
+
+cm_F_best <- yardstick::conf_mat(pred_F_best, truth = truth, estimate = pred_class)
+
+pred_F_best %>% slice_head(n = 10)
+cm_F_best
+```
+
+This output shows how the best female classifier behaves on unseen students. The prediction table makes the classification process concrete, and the confusion matrix shows a relatively balanced error pattern rather than a collapse into only one class. In plain language, the female best model is not perfect, but it is doing a meaningful job of recovering both positive and negative cases.
+
+## Best-model predictions: male subgroup
+
+This chunk reports the test-set predictions from the strongest single-model classifier in the male subgroup. The best model is selected automatically from `results_M` by test accuracy.
+
+```{r}
+# This chunk retrieves the strongest male subgroup model under the current
+# accuracy-first selection rule, applies it to the held-out test set,
+# and then reports example predictions and the confusion matrix.
+fit_lookup_M <- setNames(
+  list(logit_fit_M, rf_fit_M, tree_fit_M, enet_fit_M, svm_fit_M, knn_fit_M, mlp_fit_M, xgb_fit_M),
+  single_model_names
+)
+
+best_M_single <- results_M %>%
+  filter(Model %in% single_model_names) %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+best_model_name_M <- best_M_single$Model[[1]]
+thr_M_best <- best_M_single$Threshold[[1]]
+fit_M_best <- fit_lookup_M[[best_model_name_M]]
+
+pred_M_best <- tibble(
+  truth = test_M_mod$romantic,
+  prob_yes = get_prob_yes(fit_M_best, test_M_mod)
+) %>%
+  mutate(
+    pred_class = factor(
+      if_else(prob_yes >= thr_M_best, "yes", "no"),
+      levels = c("no", "yes")
+    )
+  )
+
+cm_M_best <- yardstick::conf_mat(pred_M_best, truth = truth, estimate = pred_class)
+
+pred_M_best %>% slice_head(n = 10)
+cm_M_best
+```
+
+This output presents the strongest male classifier on the held-out test set, and it is the clearest warning result in the whole project. The prediction table shows that the model is behaving very conservatively, and the confusion matrix shows that its moderate accuracy is driven mostly by the larger negative class rather than by real success in separating `yes` and `no`. In other words, the male subgroup should be discussed as a limitation, not as a modeling success.
+
+## Interpretation of best-model prediction outputs
+
+This section converts the confusion matrices into short plain-language interpretations so the classification results are easier to read in the paper.
+
+```{r}
+# This chunk converts the confusion matrices into short plain-language summaries.
+# It is intended to make the classification results easier to read,
+# especially for readers who are less comfortable with confusion-matrix notation.
+library(glue)
+
+get_conf_counts <- function(cm_obj) {
+  tab <- cm_obj$table
+  list(
+    TN = unname(tab["no",  "no"]),
+    FN = unname(tab["no",  "yes"]),
+    FP = unname(tab["yes", "no"]),
+    TP = unname(tab["yes", "yes"])
+  )
+}
+
+describe_conf <- function(cm_obj, label, model_name) {
+  cc <- get_conf_counts(cm_obj)
+
+  err_sentence <- if (cc$TP == 0 && cc$FP == 0) {
+    "The model predicts every case as `no`, so its apparent accuracy is being driven mostly by the larger negative class rather than by meaningful class separation."
+  } else if (cc$FP > cc$FN) {
+    "The model makes more false positives than false negatives, which means it is somewhat more willing to predict `yes`."
+  } else if (cc$FN > cc$FP) {
+    "The model makes more false negatives than false positives, which means it is somewhat more conservative and misses some true `yes` cases."
+  } else {
+    "The model shows a fairly balanced error pattern between false positives and false negatives."
+  }
+
+  glue("
+### {label}
+
+For the **{model_name}** model, the confusion matrix contains **{cc$TN} true negatives**, **{cc$TP} true positives**, **{cc$FP} false positives**, and **{cc$FN} false negatives**. {err_sentence} This helps clarify not only how accurate the model is, but also what kind of mistakes it tends to make.
+")
+}
+
+cat(describe_conf(cm_all_best, "Pooled sample interpretation", best_model_name_all))
+cat(describe_conf(cm_F_best, "Female subgroup interpretation", best_model_name_F))
+cat(describe_conf(cm_M_best, "Male subgroup interpretation", best_model_name_M))
+```
+
+Overall, these three confusion-matrix summaries tell a consistent classification story. The pooled model is usable, the female subgroup gives the strongest subgroup-specific classification result, and the male subgroup remains the weakest and least reliable part of the final classification framework. However, weak hard classification does not automatically mean useless probability estimation, so the next section re-evaluates the models as probability estimators rather than only as yes/no classifiers.
+
+## Probability-based evaluation: what this section is and why it matters
+
+The main results above evaluate the models as **hard classifiers**. In other words, each student eventually receives a final `yes` or `no` prediction after a threshold is applied to the model's predicted probability. That view is useful, but it can also hide information. A model may do only moderately well as a strict classifier while still doing a meaningful job of ranking students from lower to higher relationship chance.
+
+My professor, Dr.Iman therefore suggested a second evaluation lens: instead of asking only whether the model classifies each student correctly, I should also ask whether the predicted probabilities themselves are informative and reasonably calibrated. This is especially relevant in the current project because some models show moderate AUC values even when their Accuracy or F1 is not especially strong, and the male subgroup provides a clear example of how an accuracy-first threshold can produce a conservative classifier that hides the underlying probability signal.
+
+For that reason, this section shifts from **classification-focused evaluation** to **probability-focused evaluation**. I first compare the best hard-classification model with the best probability-ranking model in each group. I then report AUC, Brier score, log loss, and a simple calibration error summary. Finally, I visualize the probability results using two diagnostics : **(1) a calibration histogram of predicted probability versus actual chance** and **(2) a KDE plot of predicted probabilities for the true `no` and `yes` groups**. These plots help answer a different question from the earlier confusion matrices: not only “Did the model classify correctly?” but also “Did the model assign sensible probability values?”
+
+## Probability-focused model selection and summary metrics
+
+This subsection identifies the strongest **probability** model in each group by AUC rather than by Accuracy. Its role is to check whether the best model for probability estimation is the same as, or different from, the best hard-classification model.
+
+```{r prob_eval_setup}
+# This chunk re-evaluates the current models from a probability-estimation perspective.
+# It identifies the best-Accuracy model and the best-AUC model in each group,
+# prepares train/test probability tables, and computes probability-quality metrics.
+clip_prob <- function(p) {
+  pmin(pmax(as.numeric(p), 1e-6), 1 - 1e-6)
+}
+
+make_pred_tbl <- function(truth, prob) {
+  tibble(
+    truth = factor(truth, levels = c("no", "yes")),
+    prob_yes = clip_prob(prob)
+  )
+}
+
+best_acc_model <- function(results_tbl) {
+  results_tbl %>%
+    filter(Model %in% single_model_names) %>%
+    slice_max(Accuracy, n = 1, with_ties = FALSE)
+}
+
+best_prob_model <- function(results_tbl) {
+  results_tbl %>%
+    slice_max(AUC, n = 1, with_ties = FALSE)
+}
+
+get_group_prob <- function(model_name, group = c("all", "F", "M"), new_df) {
+  group <- match.arg(group)
+
+  if (group == "all") {
+    return(get_prob_yes(fit_lookup_all[[model_name]], new_df))
+  }
+
+  if (group == "F") {
+    if (model_name %in% single_model_names) {
+      return(get_prob_yes(fit_lookup_F[[model_name]], new_df))
+    }
+    if (model_name == "Avg Prob (RF+XGB+MLP)") {
+      return(rowMeans(cbind(
+        get_prob_yes(rf_fit_F, new_df),
+        get_prob_yes(xgb_fit_F, new_df),
+        get_prob_yes(mlp_fit_F, new_df)
+      )))
+    }
+    if (model_name == "Stacking Ensemble") {
+      return(get_prob_yes(stack_fit_F, new_df, fallback_fit = rf_fit_F))
+    }
+  }
+
+  if (group == "M") {
+    if (model_name %in% single_model_names) {
+      return(get_prob_yes(fit_lookup_M[[model_name]], new_df))
+    }
+    if (model_name == "Avg Prob (kNN+RF+XGB)") {
+      return(rowMeans(cbind(
+        get_prob_yes(knn_fit_M, new_df),
+        get_prob_yes(rf_fit_M, new_df),
+        get_prob_yes(xgb_fit_M, new_df)
+      )))
+    }
+    if (model_name == "Stacking Ensemble") {
+      return(get_prob_yes(stack_fit_M, new_df, fallback_fit = knn_fit_M))
+    }
+  }
+
+  stop("Unknown model name for the selected group.")
+}
+
+brier_score <- function(truth, prob) {
+  y <- if_else(truth == "yes", 1, 0)
+  mean((y - clip_prob(prob))^2)
+}
+
+log_loss <- function(truth, prob) {
+  y <- if_else(truth == "yes", 1, 0)
+  prob <- clip_prob(prob)
+  -mean(y * log(prob) + (1 - y) * log(1 - prob))
+}
+
+make_calibration_df <- function(pred_df, n_bins = 6) {
+  pred_df %>%
+    mutate(
+      truth_num = if_else(truth == "yes", 1, 0),
+      bin_id = pmin(floor(prob_yes * n_bins), n_bins - 1L),
+      bin_mid = (bin_id + 0.5) / n_bins
+    ) %>%
+    group_by(bin_id, bin_mid) %>%
+    summarise(
+      n = n(),
+      mean_pred = mean(prob_yes),
+      actual_rate = mean(truth_num),
+      .groups = "drop"
+    ) %>%
+    arrange(bin_id)
+}
+
+mean_abs_cal_error <- function(pred_df, n_bins = 6) {
+  cal_df <- make_calibration_df(pred_df, n_bins = n_bins)
+  weighted.mean(abs(cal_df$actual_rate - cal_df$mean_pred), cal_df$n)
+}
+
+prob_gap <- function(pred_df) {
+  stats <- pred_df %>%
+    group_by(truth) %>%
+    summarise(mean_prob = mean(prob_yes), .groups = "drop")
+
+  no_mean <- stats$mean_prob[stats$truth == "no"]
+  yes_mean <- stats$mean_prob[stats$truth == "yes"]
+  yes_mean - no_mean
+}
+
+best_all_acc  <- best_acc_model(results_all)
+best_F_acc    <- best_acc_model(results_F)
+best_M_acc    <- best_acc_model(results_M)
+
+best_all_prob <- best_prob_model(results_all)
+best_F_prob   <- best_prob_model(results_F)
+best_M_prob   <- best_prob_model(results_M)
+
+train_all_prob <- make_pred_tbl(
+  train_data_mod$romantic,
+  get_group_prob(best_all_prob$Model[[1]], "all", train_data_mod)
+)
+
+test_all_prob <- make_pred_tbl(
+  test_data_mod$romantic,
+  get_group_prob(best_all_prob$Model[[1]], "all", test_data_mod)
+)
+
+train_F_prob <- make_pred_tbl(
+  train_F_mod$romantic,
+  get_group_prob(best_F_prob$Model[[1]], "F", train_F_mod)
+)
+
+test_F_prob <- make_pred_tbl(
+  test_F_mod$romantic,
+  get_group_prob(best_F_prob$Model[[1]], "F", test_F_mod)
+)
+
+train_M_prob <- make_pred_tbl(
+  train_M_mod$romantic,
+  get_group_prob(best_M_prob$Model[[1]], "M", train_M_mod)
+)
+
+test_M_prob <- make_pred_tbl(
+  test_M_mod$romantic,
+  get_group_prob(best_M_prob$Model[[1]], "M", test_M_mod)
+)
+
+focus_compare <- bind_rows(
+  tibble(
+    Group = "Pooled",
+    Best_Accuracy_Model = best_all_acc$Model[[1]],
+    Best_Accuracy = best_all_acc$Accuracy[[1]],
+    Best_AUC_Model = best_all_prob$Model[[1]],
+    Best_AUC = best_all_prob$AUC[[1]]
+  ),
+  tibble(
+    Group = "Female",
+    Best_Accuracy_Model = best_F_acc$Model[[1]],
+    Best_Accuracy = best_F_acc$Accuracy[[1]],
+    Best_AUC_Model = best_F_prob$Model[[1]],
+    Best_AUC = best_F_prob$AUC[[1]]
+  ),
+  tibble(
+    Group = "Male",
+    Best_Accuracy_Model = best_M_acc$Model[[1]],
+    Best_Accuracy = best_M_acc$Accuracy[[1]],
+    Best_AUC_Model = best_M_prob$Model[[1]],
+    Best_AUC = best_M_prob$AUC[[1]]
+  )
+)
+
+prob_summary <- bind_rows(
+  tibble(
+    Group = "Pooled",
+    Model = best_all_prob$Model[[1]],
+    AUC = best_all_prob$AUC[[1]],
+    Brier = brier_score(test_all_prob$truth, test_all_prob$prob_yes),
+    LogLoss = log_loss(test_all_prob$truth, test_all_prob$prob_yes),
+    Cal_MAE = mean_abs_cal_error(test_all_prob, n_bins = 6),
+    Mean_Prob_Gap = prob_gap(test_all_prob)
+  ),
+  tibble(
+    Group = "Female",
+    Model = best_F_prob$Model[[1]],
+    AUC = best_F_prob$AUC[[1]],
+    Brier = brier_score(test_F_prob$truth, test_F_prob$prob_yes),
+    LogLoss = log_loss(test_F_prob$truth, test_F_prob$prob_yes),
+    Cal_MAE = mean_abs_cal_error(test_F_prob, n_bins = 6),
+    Mean_Prob_Gap = prob_gap(test_F_prob)
+  ),
+  tibble(
+    Group = "Male",
+    Model = best_M_prob$Model[[1]],
+    AUC = best_M_prob$AUC[[1]],
+    Brier = brier_score(test_M_prob$truth, test_M_prob$prob_yes),
+    LogLoss = log_loss(test_M_prob$truth, test_M_prob$prob_yes),
+    Cal_MAE = mean_abs_cal_error(test_M_prob, n_bins = 6),
+    Mean_Prob_Gap = prob_gap(test_M_prob)
+  )
+)
+
+focus_compare
+prob_summary
+```
+
+**Probability-focused model-selection table.** This first table compares the best hard-classification model in each group with the best probability-ranking model in each group. If these two models differ, that means the model that gives the highest Accuracy is not the same as the model that gives the best probability information.
+
+**Probability-metrics table.** This second table reports four probability-oriented summaries for the best-AUC model in each group. AUC tells me how well the model ranks students from lower to higher relationship chance, Brier score and log loss tell me how close the predicted probabilities are to the actual outcomes, and `Cal_MAE` gives a simple binned calibration-error summary. Lower Brier, log loss, and calibration error are better, while higher AUC is better.
+
+```{r prob_eval_summary_text, results='asis'}
+# This chunk converts the probability-focused tables into a short plain-language summary.
+# It is meant to directly address whether Dr.Iman's suggestion is supported.
+match_n <- sum(focus_compare$Best_Accuracy_Model == focus_compare$Best_AUC_Model)
+
+strongest_prob <- prob_summary %>% slice_max(AUC, n = 1, with_ties = FALSE)
+weakest_prob   <- prob_summary %>% slice_min(AUC, n = 1, with_ties = FALSE)
+
+cat(glue::glue(
+"**Probability-summary interpretation.** These tables partially support my professor Dr. Iman's point. The best hard-classification model and the best probability-ranking model match in only **{match_n} of the 3 groups**, which means Accuracy and probability quality are not telling exactly the same story. The clearest support appears in the **{strongest_prob$Group[[1]]}** group, where **{strongest_prob$Model[[1]]}** gives the strongest probability ranking with an AUC of **{round(strongest_prob$AUC[[1]], 3)}**. The weakest probability performance still appears in the **{weakest_prob$Group[[1]]}** group, with an AUC of **{round(weakest_prob$AUC[[1]], 3)}**. Overall, the pooled and female results are the clearest cases where the models look more informative in probability space than they do under hard classification alone.\n\n"
+))
+```
+
+## Calibration histogram: predicted probability vs actual chance
+
+A calibration histogram checks whether the **probability values themselves** are trustworthy. If a model places students into a bin around 30%, then roughly 30% of those students should actually be in a relationship. In the plots below, the bars show the actual relationship rate inside each probability bin, while the black points show the average predicted probability in that bin. When the bars and points are close, the model is better calibrated.
+
+```{r prob_plot_helpers}
+# This chunk defines helper functions for the probability plots and for the short
+# plain-language explanations placed directly after each figure.
+plot_calibration_hist <- function(pred_df, title_text, n_bins = 6) {
+  cal_df <- make_calibration_df(pred_df, n_bins = n_bins)
+
+  ggplot(cal_df, aes(x = bin_mid)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_col(aes(y = actual_rate), width = 0.9 / n_bins, alpha = 0.60) +
+    geom_point(aes(y = mean_pred, size = n), color = "black") +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+    labs(
+      title = title_text,
+      x = "Predicted probability bin",
+      y = "Actual chance (bar) and average predicted probability (point)",
+      size = "N"
+    ) +
+    theme_minimal()
+}
+
+plot_prob_kde <- function(pred_df, title_text) {
+  ggplot(pred_df, aes(x = prob_yes, fill = truth, color = truth)) +
+    geom_density(alpha = 0.20, linewidth = 1.1, adjust = 1.1) +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+    labs(
+      title = title_text,
+      x = "Predicted probability of being in a relationship",
+      y = "Density",
+      fill = "Actual class",
+      color = "Actual class"
+    ) +
+    theme_minimal()
+}
+
+describe_calibration_plot <- function(pred_df, group_label, model_name) {
+  cal_df <- make_calibration_df(pred_df, n_bins = 6)
+  mae <- weighted.mean(abs(cal_df$actual_rate - cal_df$mean_pred), cal_df$n)
+  trend_cor <- suppressWarnings(cor(cal_df$mean_pred, cal_df$actual_rate, use = "complete.obs"))
+
+  quality_text <- case_when(
+    is.na(mae) ~ "difficult to judge because the bins are sparse",
+    mae < 0.05 ~ "fairly well calibrated",
+    mae < 0.10 ~ "reasonably calibrated but still somewhat noisy",
+    mae < 0.15 ~ "only loosely calibrated",
+    TRUE ~ "quite noisy and not especially well calibrated"
+  )
+
+  trend_text <- if (!is.na(trend_cor) && trend_cor > 0.60) {
+    "The observed relationship rate generally rises as the predicted probability bins rise"
+  } else if (!is.na(trend_cor) && trend_cor > 0.30) {
+    "The observed relationship rate rises somewhat with the predicted bins, although the pattern is not perfectly smooth"
+  } else {
+    "The observed relationship rate does not rise smoothly with the predicted bins"
+  }
+
+  glue::glue(
+"**{group_label} calibration histogram.** For this plot, each bar shows the actual relationship rate within one predicted-probability bin, while the black point shows the average predicted probability in that same bin. {trend_text}. The average absolute gap between the predicted and observed bin-level values is about **{scales::percent(mae, accuracy = 1)}**, so the **{model_name}** probabilities are {quality_text} in the {tolower(group_label)}.\n\n"
+  )
+}
+
+describe_kde_plot <- function(pred_df, group_label, model_name, auc_value) {
+  stats <- pred_df %>%
+    group_by(truth) %>%
+    summarise(mean_prob = mean(prob_yes), .groups = "drop")
+
+  no_mean  <- stats$mean_prob[stats$truth == "no"]
+  yes_mean <- stats$mean_prob[stats$truth == "yes"]
+  gap <- yes_mean - no_mean
+
+  shift_text <- case_when(
+    is.na(gap) ~ "cannot be judged clearly",
+    gap >= 0.15 ~ "a clear rightward shift",
+    gap >= 0.08 ~ "a noticeable rightward shift",
+    gap >= 0.03 ~ "a small but visible rightward shift",
+    TRUE ~ "very little rightward shift"
+  )
+
+  auc_text <- case_when(
+    auc_value >= 0.75 ~ "strong ranking ability",
+    auc_value >= 0.65 ~ "moderate ranking ability",
+    auc_value >= 0.55 ~ "limited but non-zero ranking ability",
+    TRUE ~ "very weak ranking ability"
+  )
+
+  glue::glue(
+"**{group_label} KDE plot.** For this plot, the two density curves show how the predicted probabilities are distributed for students who are actually in the `no` group and the `yes` group. In the {tolower(group_label)}, the true-`yes` cases receive an average predicted probability of **{scales::percent(yes_mean, accuracy = 1)}**, compared with **{scales::percent(no_mean, accuracy = 1)}** for the true-`no` cases, which is {shift_text}. Together with an AUC of **{round(auc_value, 3)}**, this suggests {auc_text} for the **{model_name}** probability estimates.\n\n"
+  )
+}
+```
+
+### Pooled sample calibration histogram
+
+```{r pooled_calibration_hist}
+# This chunk shows whether the pooled best-AUC model is well calibrated.
+# It checks whether higher predicted probability bins correspond to higher observed relationship rates.
+plot_calibration_hist(
+  test_all_prob,
+  paste0("Calibration histogram: pooled sample (", best_all_prob$Model[[1]], ")")
+)
+```
+
+```{r pooled_calibration_text, results='asis'}
+cat(describe_calibration_plot(test_all_prob, "Pooled sample", best_all_prob$Model[[1]]))
+```
+
+### Female subgroup calibration histogram
+
+```{r female_calibration_hist}
+# This chunk shows whether the female best-AUC model is well calibrated.
+# It checks whether the predicted probabilities line up with the observed chance of a relationship.
+plot_calibration_hist(
+  test_F_prob,
+  paste0("Calibration histogram: female subgroup (", best_F_prob$Model[[1]], ")")
+)
+```
+
+```{r female_calibration_text, results='asis'}
+cat(describe_calibration_plot(test_F_prob, "Female subgroup", best_F_prob$Model[[1]]))
+```
+
+### Male subgroup calibration histogram
+
+```{r male_calibration_hist}
+# This chunk shows whether the male best-AUC model is well calibrated.
+# It is especially important because the male hard-classification results were weak.
+plot_calibration_hist(
+  test_M_prob,
+  paste0("Calibration histogram: male subgroup (", best_M_prob$Model[[1]], ")")
+)
+```
+
+```{r male_calibration_text, results='asis'}
+cat(describe_calibration_plot(test_M_prob, "Male subgroup", best_M_prob$Model[[1]]))
+```
+
+## KDE plot of predicted probabilities
+
+A KDE plot looks at a different issue from calibration. Instead of asking whether the probabilities are on the correct scale, it asks whether the model gives **higher probabilities to the students who are actually in the `yes` group**. The more the `yes` curve shifts to the right of the `no` curve, the more useful the model is as a probability-ranking tool, even if the two curves still overlap.
+
+### Pooled sample KDE plot
+
+```{r pooled_kde_plot}
+# This chunk shows the probability-density separation for the pooled best-AUC model.
+# It compares the predicted probabilities for the true no and true yes groups.
+plot_prob_kde(
+  test_all_prob,
+  paste0("KDE of predicted probabilities: pooled sample (", best_all_prob$Model[[1]], ")")
+)
+```
+
+```{r pooled_kde_text, results='asis'}
+cat(describe_kde_plot(test_all_prob, "Pooled sample", best_all_prob$Model[[1]], best_all_prob$AUC[[1]]))
+```
+
+### Female subgroup KDE plot
+
+```{r female_kde_plot}
+# This chunk shows the probability-density separation for the female best-AUC model.
+# A stronger rightward shift of the yes curve.
+plot_prob_kde(
+  test_F_prob,
+  paste0("KDE of predicted probabilities: female subgroup (", best_F_prob$Model[[1]], ")")
+)
+```
+
+```{r female_kde_text, results='asis'}
+cat(describe_kde_plot(test_F_prob, "Female subgroup", best_F_prob$Model[[1]], best_F_prob$AUC[[1]]))
+```
+
+### Male subgroup KDE plot
+
+```{r male_kde_plot}
+# This chunk shows the probability-density separation for the male best-AUC model.
+# Even if classification is weak, some rightward shift would still indicate usable probability signal.
+plot_prob_kde(
+  test_M_prob,
+  paste0("KDE of predicted probabilities: male subgroup (", best_M_prob$Model[[1]], ")")
+)
+```
+
+```{r male_kde_text, results='asis'}
+cat(describe_kde_plot(test_M_prob, "Male subgroup", best_M_prob$Model[[1]], best_M_prob$AUC[[1]]))
+```
+
+## Simple improvement: post-hoc probability calibration
+
+If the plots above show that the models rank students reasonably well but the absolute probability scale is still somewhat off, a simple improvement is to **recalibrate the probabilities after model fitting** instead of retraining every model from scratch. The idea is straightforward: I keep the original model predictions, then fit a small logistic calibration model on the training-set probabilities and apply that correction to the test set. This does not try to change the ordering of students very much; instead, it tries to make the reported probabilities themselves more realistic.
+
+```{r posthoc_calibration}
+# This chunk applies a simple logistic recalibration step to the best-AUC model in each group.
+# It compares the raw probabilities with the recalibrated probabilities using Brier score and log loss.
+fit_logistic_calibrator <- function(pred_df) {
+  cal_df <- pred_df %>%
+    mutate(
+      y = if_else(truth == "yes", 1, 0),
+      lp = qlogis(clip_prob(prob_yes))
+    )
+
+  if (dplyr::n_distinct(cal_df$lp) < 2) {
+    return(NULL)
+  }
+
+  glm(y ~ lp, data = cal_df, family = binomial())
+}
+
+apply_logistic_calibrator <- function(prob, cal_fit) {
+  prob <- clip_prob(prob)
+
+  if (is.null(cal_fit)) {
+    return(prob)
+  }
+
+  as.numeric(
+    plogis(
+      predict(
+        cal_fit,
+        newdata = tibble(lp = qlogis(prob)),
+        type = "link"
+      )
+    )
+  )
+}
+
+cal_fit_all <- fit_logistic_calibrator(train_all_prob)
+cal_fit_F   <- fit_logistic_calibrator(train_F_prob)
+cal_fit_M   <- fit_logistic_calibrator(train_M_prob)
+
+test_all_prob_cal <- test_all_prob %>%
+  mutate(prob_cal = apply_logistic_calibrator(prob_yes, cal_fit_all))
+
+test_F_prob_cal <- test_F_prob %>%
+  mutate(prob_cal = apply_logistic_calibrator(prob_yes, cal_fit_F))
+
+test_M_prob_cal <- test_M_prob %>%
+  mutate(prob_cal = apply_logistic_calibrator(prob_yes, cal_fit_M))
+
+calibration_compare <- bind_rows(
+  tibble(
+    Group = "Pooled",
+    Model = best_all_prob$Model[[1]],
+    Raw_Brier = brier_score(test_all_prob_cal$truth, test_all_prob_cal$prob_yes),
+    Calibrated_Brier = brier_score(test_all_prob_cal$truth, test_all_prob_cal$prob_cal),
+    Raw_LogLoss = log_loss(test_all_prob_cal$truth, test_all_prob_cal$prob_yes),
+    Calibrated_LogLoss = log_loss(test_all_prob_cal$truth, test_all_prob_cal$prob_cal)
+  ),
+  tibble(
+    Group = "Female",
+    Model = best_F_prob$Model[[1]],
+    Raw_Brier = brier_score(test_F_prob_cal$truth, test_F_prob_cal$prob_yes),
+    Calibrated_Brier = brier_score(test_F_prob_cal$truth, test_F_prob_cal$prob_cal),
+    Raw_LogLoss = log_loss(test_F_prob_cal$truth, test_F_prob_cal$prob_yes),
+    Calibrated_LogLoss = log_loss(test_F_prob_cal$truth, test_F_prob_cal$prob_cal)
+  ),
+  tibble(
+    Group = "Male",
+    Model = best_M_prob$Model[[1]],
+    Raw_Brier = brier_score(test_M_prob_cal$truth, test_M_prob_cal$prob_yes),
+    Calibrated_Brier = brier_score(test_M_prob_cal$truth, test_M_prob_cal$prob_cal),
+    Raw_LogLoss = log_loss(test_M_prob_cal$truth, test_M_prob_cal$prob_yes),
+    Calibrated_LogLoss = log_loss(test_M_prob_cal$truth, test_M_prob_cal$prob_cal)
+  )
+) %>%
+  mutate(
+    Brier_Improvement = Raw_Brier - Calibrated_Brier,
+    LogLoss_Improvement = Raw_LogLoss - Calibrated_LogLoss
+  )
+
+calibration_compare
+```
+
+**Post-hoc calibration table.** This table compares the original probability scores with a simple logistic recalibration fitted on the training-set probabilities. Positive improvement values mean the recalibrated probabilities are better by that metric. This is a lightweight improvement because it does not require rerunning the heavy model-tuning pipeline.
+
+```{r posthoc_calibration_text, results='asis'}
+# This chunk translates the calibration-comparison table into a short interpretation.
+# It explains whether the simple recalibration step helps and why it matters.
+helpful_groups <- calibration_compare %>%
+  filter(Brier_Improvement > 0 | LogLoss_Improvement > 0) %>%
+  pull(Group)
+
+helpful_text <- if (length(helpful_groups) == 0) {
+  "In this render, the recalibration gains are small or mixed across groups, so the main value of the section is diagnostic rather than corrective."
+} else {
+  paste0(
+    "In this render, the recalibration step helps most clearly in: **",
+    paste(helpful_groups, collapse = ", "),
+    "**."
+  )
+}
+
+cat(glue::glue(
+"**Post-hoc calibration interpretation.** This comparison shows whether a simple probability recalibration can improve the model outputs without retraining the full models. {helpful_text} Because this correction is monotonic, it mainly adjusts the probability scale rather than the ranking of students, so it is best understood as a probability-quality improvement rather than a new classification model.\n\n"
+))
+```
+
+## Final probability-based takeaway
+
+Taken together, these probability diagnostics provide a more nuanced reading of the project: the current models, especially in the pooled sample and the female subgroup, are more informative as **probability estimators** than the hard-classification results alone might suggest. At the same time, the male subgroup still remains the most difficult part of the project even under a probability-focused lens, which is consistent with its smaller sample, stronger instability across versions, and the stricter student-level data construction used in Final version. The most practical improvement added here is the post-hoc calibration step, and the clearest future probability-first upgrade would be to tune and compare models directly by probability metrics such as log loss or Brier score instead of selecting everything from an accuracy-first perspective.

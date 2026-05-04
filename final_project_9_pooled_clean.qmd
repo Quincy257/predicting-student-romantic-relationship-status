@@ -1,0 +1,1527 @@
+---
+title: "Predict Student Romantic Relationship Status"
+author: "Weiyang Sheng"
+format: pdf
+editor: visual
+---
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+## keep this chunk!
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  tidy = "styler",
+  fig.align = "center"
+)
+```
+
+## Project setup
+
+This chunk loads the packages used throughout the analysis and fixes the random seed so the workflow is reproducible. It provides the software foundation for the entire project.
+
+```{r setup, message=FALSE, warning=FALSE}
+# This chunk loads the packages used throughout the project.
+# It also fixes the random seed so that the workflow is reproducible.
+# The goal is to keep the analysis stable and transparent.
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(stacks)
+library(xgboost)
+library(kernlab)
+library(nnet)
+library(finetune)
+library(broom)
+library(glue)
+library(ranger)
+
+options(yardstick.event_first = FALSE)
+set.seed(123)
+```
+
+This chunk does not produce a substantive analytical result by itself. Its main purpose is to prepare a stable and reproducible environment for the rest of the project.
+
+## Data import and sample construction
+
+This chunk reads the Math and Portuguese course datasets, identifies overlapping students, and constructs a cleaner merged-student sample. Its role in the paper is to show that the final analysis is based on student-level data rather than double-counting the same student across two course files.
+
+```{r import}
+# This chunk reads the Math and Portuguese datasets.
+# It identifies overlapping students and merges repeated records into one student-level row.
+# The goal is to build the main analysis sample and avoid double-counting the same student.
+student_por <- read_csv("student-por.csv", show_col_types = FALSE)
+student_mat <- read_csv("student-mat.csv", show_col_types = FALSE)
+
+student_mat <- student_mat %>% mutate(course = "Math")
+student_por <- student_por %>% mutate(course = "Portuguese")
+
+id_vars <- c(
+  "school", "sex", "age", "address", "famsize", "Pstatus",
+  "Medu", "Fedu", "Mjob", "Fjob", "reason", "nursery", "internet"
+)
+
+dup_students <- inner_join(
+  student_mat %>% dplyr::select(all_of(id_vars)) %>% distinct(),
+  student_por %>% dplyr::select(all_of(id_vars)) %>% distinct(),
+  by = id_vars
+)
+
+nrow(dup_students)   # overlap count based on id_vars
+
+mode_value <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+rounded_mean_or_na <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  round(mean(as.numeric(x), na.rm = TRUE))
+}
+
+mean_or_na <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  mean(as.numeric(x), na.rm = TRUE)
+}
+
+# Keep these variables on their original discrete scales so merging does not create awkward values such as 1.5 or 2.5.
+rounded_merge_vars <- c(
+  "traveltime", "studytime", "failures", "famrel",
+  "freetime", "goout", "Dalc", "Walc", "health"
+)
+
+# These variables can be merged using the mean.
+mean_merge_vars <- c("absences", "G1", "G2", "G3")
+
+# Merge yes/no variables using the mode.
+yesno_merge_vars <- c("schoolsup", "famsup", "paid", "activities", "higher", "romantic")
+
+# Merge other categorical variables using the mode.
+categorical_merge_vars <- c("guardian")
+
+student_all <- bind_rows(student_mat, student_por) %>%
+  tidyr::unite("student_id", all_of(id_vars), sep = "__", remove = FALSE) %>%
+  dplyr::group_by(student_id) %>%
+  dplyr::summarise(
+    dplyr::across(all_of(id_vars), ~ dplyr::first(.x)),
+    course = dplyr::if_else(dplyr::n_distinct(course) > 1, "Both", dplyr::first(course)),
+    dplyr::across(any_of(rounded_merge_vars), rounded_mean_or_na),
+    dplyr::across(any_of(mean_merge_vars), mean_or_na),
+    dplyr::across(any_of(yesno_merge_vars), ~ mode_value(as.character(.x))),
+    dplyr::across(any_of(categorical_merge_vars), ~ mode_value(as.character(.x))),
+    .groups = "drop"
+  ) %>%
+  dplyr::select(-student_id)
+
+nrow(student_all)
+readr::write_csv(student_all, "student_all_merged.csv")
+```
+
+**Interpretation.** This output shows that there is substantial overlap between the two course files, so merging repeated records is necessary before modeling. After repeated records are combined, the final analytic sample contains 662 unique students. In simple terms, the project is working at the student level rather than double-counting the same person across two subjects.
+
+## Data cleaning and feature engineering
+
+This chunk converts raw variables into analysis-ready predictors, including parental education percentages, SES-style job groupings, age groups, and alcohol-related measures. In this version, the project uses one pooled sample only, and sex is kept as an explicit predictor rather than splitting the modeling pipeline into separate female and male branches.
+
+```{r feature_engineering}
+# This chunk converts raw variables into analysis-ready features.
+# It recodes variables, creates grouped and percentage-based predictors,
+# and builds the train/test split for the pooled analysis only.
+students <- student_all %>%
+  mutate(
+    romantic = factor(romantic, levels = c("no", "yes")),
+    sex = factor(sex),
+    school = factor(school),
+    address = factor(address),
+    famsize = factor(famsize),
+    Pstatus = factor(Pstatus),
+    Mjob = factor(Mjob),
+    Fjob = factor(Fjob),
+    guardian = factor(guardian),
+    course = factor(course, levels = c("Math", "Portuguese", "Both")),
+    schoolsup = factor(schoolsup, levels = c("no", "yes")),
+    famsup = factor(famsup, levels = c("no", "yes")),
+    paid = factor(paid, levels = c("no", "yes")),
+    activities = factor(activities, levels = c("no", "yes")),
+    higher = factor(higher, levels = c("no", "yes")),
+    internet = factor(internet, levels = c("no", "yes")),
+    Medu = as.numeric(Medu),
+    Fedu = as.numeric(Fedu),
+    age = as.numeric(age),
+    traveltime = as.numeric(traveltime),
+    studytime = as.numeric(studytime),
+    failures = as.numeric(failures),
+    famrel = as.numeric(famrel),
+    freetime = as.numeric(freetime),
+    goout = as.numeric(goout),
+    Dalc = as.numeric(Dalc),
+    Walc = as.numeric(Walc),
+    health = as.numeric(health),
+    absences = as.numeric(absences),
+    G1 = as.numeric(G1),
+    G2 = as.numeric(G2),
+    G3 = as.numeric(G3),
+    Medu_pct = 100 * Medu / 4,
+    Fedu_pct = 100 * Fedu / 4,
+    edu_gap_pct = abs(Medu_pct - Fedu_pct),
+    Mjob_ses = case_when(
+      Mjob %in% c("teacher", "health") ~ "higher",
+      Mjob %in% c("services") ~ "middle",
+      TRUE ~ "lower"
+    ),
+    Mjob_ses = factor(Mjob_ses, levels = c("lower", "middle", "higher")),
+    Fjob_ses = case_when(
+      Fjob %in% c("teacher", "health") ~ "higher",
+      Fjob %in% c("services") ~ "middle",
+      TRUE ~ "lower"
+    ),
+    Fjob_ses = factor(Fjob_ses, levels = c("lower", "middle", "higher")),
+    age_group = case_when(
+      age <= 16 ~ "15-16",
+      age == 17 ~ "17",
+      age == 18 ~ "18",
+      age >= 19 ~ "19+"
+    ),
+    age_group = factor(age_group, levels = c("15-16", "17", "18", "19+")),
+    alc_mean = (Dalc + Walc) / 2,
+    alc_risk = factor(if_else(Walc >= 4 | Dalc >= 3, "higher", "lower"),
+                      levels = c("lower", "higher")),
+    freetime_pct = 100 * (freetime - 1) / 4,
+    goout_pct = 100 * (goout - 1) / 4,
+    studytime_pct = 100 * (studytime - 1) / 3,
+    alc_mean_pct = 100 * (alc_mean - 1) / 4
+  )
+
+set.seed(123)
+splits <- initial_split(students, prop = 0.8, strata = romantic)
+train_data <- training(splits)
+test_data  <- testing(splits)
+
+train_data_mod <- train_data
+test_data_mod  <- test_data
+
+# Build lightweight pooled datasets without sex for the later ablation check.
+train_data_nosex <- train_data_mod %>% dplyr::select(-sex)
+test_data_nosex  <- test_data_mod %>% dplyr::select(-sex)
+
+prop.table(table(train_data$romantic))
+prop.table(table(test_data$romantic))
+```
+
+**Interpretation.** These outputs show that the train and test sets have almost the same class balance. About 62.5% of students are in the `no` group and about 37.5% are in the `yes` group in both splits. That means the stratified split worked well and the held-out test set remains comparable to the training data.
+
+## Plot analysis: relationship rate by sex
+
+This chunk gives the overall relationship rate for female and male students. Its role is to establish the baseline sex difference before moving into pooled predictive modeling with sex retained as a predictor.
+
+```{r sex_descriptive_plot}
+# This chunk provides the overall relationship rate for female and male students.
+# It is meant to establish the baseline sex difference before moving into
+# pooled modeling where sex is kept as a predictor.
+students %>%
+  group_by(sex) %>%
+  summarise(prop_yes = mean(romantic == "yes"), n = n(), .groups = "drop") %>%
+  ggplot(aes(x = sex, y = prop_yes)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Relationship Rate by Sex",
+    x = "Sex",
+    y = "Proportion (romantic = yes)"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** This plot shows the overall relationship prevalence in female and male students. The female bar is clearly higher than the male bar, which means sex is not just a background demographic label here; it is an informative pooled predictor that deserves to stay in the model.
+
+## Plot analysis: adjusted absences effect
+
+This chunk uses a logistic model to estimate the adjusted relationship between absences and the probability of being in a relationship. Its role is to move beyond raw grouped percentages and show a smoother, more interpretable pattern for one of the clearest predictors in the current results.
+
+```{r absences_plot}
+# This chunk fits a logistic model to estimate the adjusted relationship between absences
+# and the probability of being in a relationship. It uses a quadratic term and plots
+# sex-specific predicted probabilities with confidence intervals.
+students_abs <- students %>%
+  mutate(abs_cap = pmin(absences, 15))  # Cap very large absence values at 15 so the far tail is not too sparse.
+
+abs_vis_fit <- glm(
+  I(romantic == "yes") ~ poly(abs_cap, 2, raw = TRUE) * sex,
+  family = binomial(),
+  data = students_abs
+)
+
+abs_grid <- expand.grid(
+  abs_cap = 0:15,
+  sex = levels(students_abs$sex)
+)
+
+abs_pred <- predict(abs_vis_fit, newdata = abs_grid, type = "link", se.fit = TRUE)
+
+abs_plot_df <- abs_grid %>%
+  mutate(
+    fit_link = abs_pred$fit,
+    se_link = abs_pred$se.fit,
+    prob = plogis(fit_link),
+    lower = plogis(fit_link - 1.96 * se_link),
+    upper = plogis(fit_link + 1.96 * se_link)
+  )
+
+ggplot(abs_plot_df, aes(x = abs_cap, y = prob, color = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Adjusted relationship probability by absences",
+    subtitle = "Curves are based on a logistic model with a quadratic term; absences above 15 are capped",
+    x = "Absences (capped at 15)",
+    y = "Predicted probability of being in a relationship",
+    color = "Sex",
+    fill = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** This plot shows the model-adjusted relationship between absences and predicted relationship probability. The main pattern is that higher absence levels tend to be associated with higher relationship probability, and the shape differs somewhat by sex. This makes absences one of the more relevant behavioral variables to retain in the final report.
+
+## Plot analysis: internet access
+
+This chunk visualizes internet access as a simple and interpretable binary predictor, with labels showing the sex-specific percentage-point difference from the no-internet group. Its role is to highlight a direct opportunity/resource variable that is easier to interpret than the weaker parent-education effects.
+
+```{r internet_plot}
+# This chunk compares relationship rates between students with and without internet at home.
+# It also labels the sex-specific percentage-point difference relative to the no-internet group,
+# making the result easy to interpret directly.
+internet_df <- students %>%
+  group_by(sex, internet) %>%
+  summarise(
+    prop_yes = mean(romantic == "yes"),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(sex) %>%
+  mutate(
+    base_no = prop_yes[internet == "no"],
+    diff_pp = 100 * (prop_yes - base_no)
+  ) %>%
+  ungroup()
+
+ggplot(internet_df, aes(x = internet, y = prop_yes, fill = sex)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_text(
+    aes(
+      label = if_else(
+        internet == "yes",
+        paste0(scales::percent(prop_yes, accuracy = 1), "\n", sprintf("%+.0f pp", diff_pp), "\nN=", n),
+        paste0(scales::percent(prop_yes, accuracy = 1), "\nBaseline\nN=", n)
+      )
+    ),
+    position = position_dodge(width = 0.75),
+    vjust = -0.2,
+    size = 3
+  ) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Internet access and relationship rate",
+    subtitle = "Labels show the sex-specific percentage-point difference from the no-internet group",
+    x = "Internet at home",
+    y = "Proportion in relationship (romantic = yes)",
+    fill = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** This plot compares relationship prevalence by internet access. Students with internet access are slightly more likely to report a relationship in both sexes, which makes internet access a stable and interpretable pooled predictor.
+
+## Plot analysis: adjusted study time effect
+
+This chunk shows the model-adjusted probability of being in a relationship across study-time levels, separately by sex. Its role is to present study time as a level-based predictor rather than forcing it into a misleading straight-line interpretation.
+
+```{r studytime_plot}
+# This chunk estimates the model-adjusted probability of being in a relationship
+# across study-time levels, separately by sex. It treats study time as a level-based
+# predictor rather than forcing it into a simple straight-line effect.
+study_vis_fit <- glm(
+  I(romantic == "yes") ~ factor(studytime) * sex,
+  family = binomial(),
+  data = students
+)
+
+study_grid <- expand.grid(
+  studytime = sort(unique(students$studytime)),
+  sex = levels(students$sex)
+)
+
+study_pred <- predict(study_vis_fit, newdata = study_grid, type = "link", se.fit = TRUE)
+
+study_plot_df <- study_grid %>%
+  mutate(
+    fit_link = study_pred$fit,
+    se_link = study_pred$se.fit,
+    prob = plogis(fit_link),
+    lower = plogis(fit_link - 1.96 * se_link),
+    upper = plogis(fit_link + 1.96 * se_link)
+  ) %>%
+  left_join(
+    students %>%
+      group_by(sex, studytime) %>%
+      summarise(n = n(), .groups = "drop"),
+    by = c("sex", "studytime")
+  )
+
+ggplot(study_plot_df, aes(x = factor(studytime), y = prob, fill = sex)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    position = position_dodge(width = 0.75),
+    width = 0.15
+  ) +
+  geom_text(
+    aes(label = paste0("N=", n)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.3,
+    size = 3
+  ) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Adjusted relationship probability by study time",
+    subtitle = "Bars show model-adjusted predicted probability; error bars show 95% CI",
+    x = "Study time level",
+    y = "Predicted probability of being in a relationship",
+    fill = "Sex"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** This plot shows that study time is not well described by a simple straight line. Moderate study-time levels are associated with the highest predicted relationship probability, while the most intensive study group is lower. That makes study time more useful as a nonlinear or level-based predictor than as a simple monotonic one.
+
+## Modeling approach: preprocessing recipe
+
+This chunk defines the preprocessing pipeline used before machine-learning models are fitted. Its role is to make the predictive comparison fair by standardizing numeric variables, collapsing rare categories, removing redundant predictors, and creating dummy-coded inputs where needed.
+
+```{r recipe_chunk}
+# This chunk defines the preprocessing pipeline for the pooled model.
+# It removes redundant variables, collapses rare categories,
+# standardizes numeric predictors, and creates dummy-coded features for modeling.
+rec_all <- recipe(romantic ~ ., data = train_data_mod) %>%
+  step_rm(
+    course, age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+    freetime_pct, goout_pct, studytime_pct, alc_mean_pct
+  ) %>%
+  step_other(all_nominal_predictors(), threshold = 0.03, other = "other_collapsed") %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+# This second recipe is identical except that sex is removed from the predictor set.
+# It is used only for a concise pooled ablation check on whether keeping sex helps.
+rec_all_nosex <- recipe(romantic ~ ., data = train_data_nosex) %>%
+  step_rm(
+    course, age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+    freetime_pct, goout_pct, studytime_pct, alc_mean_pct
+  ) %>%
+  step_other(all_nominal_predictors(), threshold = 0.03, other = "other_collapsed") %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+```
+
+This chunk is a preprocessing step rather than a substantive result. Its role is to make the later model comparison fair by giving all pooled models a consistent input structure.
+
+## Baseline model: logistic regression
+
+This chunk fits logistic regression models for the pooled sample. Its role is to provide an interpretable statistical baseline before comparing more flexible nonlinear models.
+
+```{r logistic_baseline}
+# This chunk fits the baseline logistic-regression model for the pooled sample.
+# It provides an interpretable benchmark before moving to more flexible machine-learning models.
+logit_spec <- logistic_reg() %>% set_engine("glm")
+
+logit_wf <- workflow() %>%
+  add_recipe(rec_all) %>%
+  add_model(logit_spec)
+logit_fit <- fit(logit_wf, data = train_data_mod)
+
+# This second pooled logistic model removes sex and is used for a direct pooled ablation check.
+logit_wf_nosex <- workflow() %>%
+  add_recipe(rec_all_nosex) %>%
+  add_model(logit_spec)
+logit_fit_nosex <- fit(logit_wf_nosex, data = train_data_nosex)
+
+logit_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(p.value)
+```
+
+**Interpretation.** This coefficient table reports the pooled logistic baseline on the log-odds scale. The clearest signals near the top are usually sex, absences, activity-related variables, and access-related variables rather than the weaker family-background terms. In practical terms, the pooled baseline already points more strongly toward sex and behavior-related variables than toward parental background alone.
+
+## Tuned machine-learning models and ensemble construction
+
+This chunk tunes multiple predictive models, including Random Forest, Elastic Net, SVM, kNN, MLP, XGBoost, and a stacking ensemble. Its role is to test whether more flexible models improve prediction beyond the interpretable logistic baseline while keeping the analysis at the pooled student level.
+
+```{r tuned_models}
+#| cache: true
+# This chunk tunes several machine-learning models, including Random Forest,
+# Elastic Net, SVM, kNN, MLP, XGBoost, and a stacking ensemble.
+# The goal is to compare flexible pooled predictive models against the logistic baseline.
+metric_cls <- metric_set(accuracy, roc_auc)
+
+rf_spec_tune <- rand_forest(
+  mode  = "classification",
+  trees = tune(),
+  mtry  = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity")
+
+enet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet", maxit = 200000) %>%
+  set_mode("classification")
+
+svm_spec <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+mlp_spec <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+xgb_spec <- boost_tree(
+  trees       = tune(),
+  tree_depth  = tune(),
+  learn_rate  = tune(),
+  mtry        = tune(),
+  min_n       = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost", verbosity = 0) %>%
+  set_mode("classification")
+
+tree_spec_tune <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth      = tune(),
+  min_n           = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+get_n_pred <- function(train_df, rec_obj) {
+  rec_obj %>%
+    prep(training = train_df, retain = TRUE) %>%
+    juice() %>%
+    dplyr::select(-romantic) %>%
+    ncol()
+}
+
+best_mean_metric <- function(res_obj, metric_name) {
+  out <- tryCatch(
+    show_best(res_obj, metric = metric_name, n = 1) %>% dplyr::pull(mean),
+    error = function(e) NA_real_
+  )
+  out[1]
+}
+
+fit_one_pooled_ensemble <- function(train_df, rec_obj, v = 10,
+                                    acc_cut = 0.72,
+                                    bayes_iter = 20) {
+  set.seed(123)
+  folds <- vfold_cv(train_df, v = v, strata = romantic)
+
+  ctrl_grid_stack <- tune::control_grid(
+    save_pred = TRUE,
+    save_workflow = TRUE,
+    event_level = "second",
+    parallel_over = "resamples"
+  )
+
+  ctrl_bayes_stack <- tune::control_bayes(
+    save_pred = TRUE,
+    save_workflow = TRUE,
+    event_level = "second",
+    no_improve = 8,
+    verbose = FALSE,
+    parallel_over = "resamples"
+  )
+
+  ctrl_race_stack <- finetune::control_race(
+    save_pred = TRUE,
+    save_workflow = TRUE,
+    event_level = "second",
+    burn_in = 3,
+    num_ties = 10,
+    verbose_elim = FALSE,
+    parallel_over = "resamples"
+  )
+
+  rf_wf   <- workflow() %>% add_recipe(rec_obj) %>% add_model(rf_spec_tune)
+  enet_wf <- workflow() %>% add_recipe(rec_obj) %>% add_model(enet_spec)
+  svm_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(svm_spec)
+  knn_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(knn_spec)
+  mlp_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(mlp_spec)
+  xgb_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(xgb_spec)
+  tree_wf <- workflow() %>% add_recipe(rec_obj) %>% add_model(tree_spec_tune)
+
+  n_pred <- get_n_pred(train_df, rec_obj)
+
+  rf_params <- hardhat::extract_parameter_set_dials(rf_spec_tune) %>%
+    update(
+      trees = dials::trees(c(500, 2000)),
+      mtry  = dials::mtry(c(2, n_pred)),
+      min_n = dials::min_n(c(2, 30))
+    )
+  rf_grid <- dials::grid_space_filling(rf_params, size = 25)
+
+  knn_params <- hardhat::extract_parameter_set_dials(knn_spec) %>%
+    update(neighbors = dials::neighbors(c(3, 80)))
+  knn_grid <- dials::grid_space_filling(knn_params, size = 25)
+
+  tree_params <- hardhat::extract_parameter_set_dials(tree_spec_tune) %>%
+    update(
+      tree_depth      = dials::tree_depth(c(1, 12)),
+      min_n           = dials::min_n(c(2, 40)),
+      cost_complexity = dials::cost_complexity(c(-5, -1))
+    )
+  tree_grid <- dials::grid_space_filling(tree_params, size = 25)
+
+  enet_params <- hardhat::extract_parameter_set_dials(enet_spec)
+  enet_grid <- dials::grid_space_filling(enet_params, size = 12)
+
+  svm_params <- hardhat::extract_parameter_set_dials(svm_spec)
+  svm_grid  <- dials::grid_space_filling(svm_params, size = 15)
+
+  mlp_params <- hardhat::extract_parameter_set_dials(mlp_spec)
+  mlp_grid <- dials::grid_space_filling(mlp_params, size = 15)
+
+  xgb_params <- hardhat::extract_parameter_set_dials(xgb_spec) %>%
+    update(
+      mtry        = dials::mtry(c(2, n_pred)),
+      trees       = dials::trees(c(300, 2000)),
+      tree_depth  = dials::tree_depth(c(2, 10)),
+      min_n       = dials::min_n(c(2, 30)),
+      learn_rate  = dials::learn_rate(c(-4, -1)),
+      sample_size = dials::sample_prop(c(0.5, 1.0))
+    )
+  xgb_grid <- dials::grid_space_filling(xgb_params, size = 15)
+
+  bayes_refine <- function(wf_obj, param_info, init_grid, resamples, iter = 20) {
+    set.seed(123)
+    init_res <- tune_grid(
+      wf_obj,
+      resamples = resamples,
+      grid = init_grid,
+      param_info = param_info,
+      metrics = metric_cls,
+      control = ctrl_grid_stack
+    )
+
+    set.seed(123)
+    tune_bayes(
+      wf_obj,
+      resamples = resamples,
+      initial = init_res,
+      iter = iter,
+      param_info = param_info,
+      metrics = metric_cls,
+      control = ctrl_bayes_stack
+    )
+  }
+
+  set.seed(123)
+  rf_res <- finetune::tune_race_anova(
+    rf_wf,
+    resamples = folds,
+    grid = rf_grid,
+    metrics = metric_cls,
+    control = ctrl_race_stack
+  )
+
+  set.seed(123)
+  knn_res <- finetune::tune_race_anova(
+    knn_wf,
+    resamples = folds,
+    grid = knn_grid,
+    metrics = metric_cls,
+    control = ctrl_race_stack
+  )
+
+  set.seed(123)
+  tree_res <- finetune::tune_race_anova(
+    tree_wf,
+    resamples = folds,
+    grid = tree_grid,
+    metrics = metric_cls,
+    control = ctrl_race_stack
+  )
+
+  enet_res <- bayes_refine(enet_wf, enet_params, enet_grid, folds, iter = bayes_iter)
+  svm_res  <- bayes_refine(svm_wf,  svm_params,  svm_grid,  folds, iter = bayes_iter)
+  mlp_res  <- bayes_refine(mlp_wf,  mlp_params,  mlp_grid,  folds, iter = bayes_iter)
+  xgb_res  <- bayes_refine(xgb_wf,  xgb_params,  xgb_grid,  folds, iter = bayes_iter)
+
+  family_tbl <- tibble(
+    family = c("rf", "knn", "xgb", "mlp", "svm", "tree", "enet"),
+    auc = c(
+      best_mean_metric(rf_res, "roc_auc"),
+      best_mean_metric(knn_res, "roc_auc"),
+      best_mean_metric(xgb_res, "roc_auc"),
+      best_mean_metric(mlp_res, "roc_auc"),
+      best_mean_metric(svm_res, "roc_auc"),
+      best_mean_metric(tree_res, "roc_auc"),
+      best_mean_metric(enet_res, "roc_auc")
+    ),
+    acc = c(
+      best_mean_metric(rf_res, "accuracy"),
+      best_mean_metric(knn_res, "accuracy"),
+      best_mean_metric(xgb_res, "accuracy"),
+      best_mean_metric(mlp_res, "accuracy"),
+      best_mean_metric(svm_res, "accuracy"),
+      best_mean_metric(tree_res, "accuracy"),
+      best_mean_metric(enet_res, "accuracy")
+    )
+  ) %>%
+    arrange(desc(acc), desc(auc))
+
+  families_keep <- family_tbl %>%
+    filter(acc >= acc_cut) %>%
+    pull(family)
+
+  if (length(families_keep) < 3) {
+    families_keep <- family_tbl %>%
+      slice_head(n = 3) %>%
+      pull(family)
+  }
+
+  stack_obj <- stacks()
+
+  if ("rf"   %in% families_keep) stack_obj <- stack_obj %>% add_candidates(rf_res)
+  if ("knn"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(knn_res)
+  if ("xgb"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(xgb_res)
+  if ("mlp"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(mlp_res)
+  if ("svm"  %in% families_keep) stack_obj <- stack_obj %>% add_candidates(svm_res)
+  if ("tree" %in% families_keep) stack_obj <- stack_obj %>% add_candidates(tree_res)
+  if ("enet" %in% families_keep) stack_obj <- stack_obj %>% add_candidates(enet_res)
+
+  stack_fit <- tryCatch(
+    stack_obj %>%
+      blend_predictions(
+        penalty = 10^seq(-6, -1, length.out = 40),
+        metric = metric_set(accuracy)
+      ) %>%
+      fit_members(),
+    error = function(e) NULL
+  )
+
+  fit_best <- function(wf_obj, res_obj, train_df_inner) {
+    best_params <- tune::select_best(res_obj, metric = "accuracy")
+    wf_final <- tune::finalize_workflow(wf_obj, best_params)
+    fit(wf_final, data = train_df_inner)
+  }
+
+  list(
+    folds = folds,
+    family_tbl = family_tbl,
+    families_keep = families_keep,
+    rf_best   = tune::select_best(rf_res,   metric = "accuracy"),
+    knn_best  = tune::select_best(knn_res,  metric = "accuracy"),
+    xgb_best  = tune::select_best(xgb_res,  metric = "accuracy"),
+    tree_best = tune::select_best(tree_res, metric = "accuracy"),
+    rf_fit   = fit_best(rf_wf,   rf_res,   train_df),
+    enet_fit = fit_best(enet_wf, enet_res, train_df),
+    svm_fit  = fit_best(svm_wf,  svm_res,  train_df),
+    knn_fit  = fit_best(knn_wf,  knn_res,  train_df),
+    mlp_fit  = fit_best(mlp_wf,  mlp_res,  train_df),
+    xgb_fit  = fit_best(xgb_wf,  xgb_res,  train_df),
+    tree_fit = fit_best(tree_wf, tree_res, train_df),
+    stack_fit = stack_fit,
+    rf_res   = rf_res,
+    knn_res  = knn_res,
+    xgb_res  = xgb_res,
+    tree_res = tree_res,
+    svm_res  = svm_res,
+    enet_res = enet_res,
+    mlp_res  = mlp_res
+  )
+}
+
+ens_all <- fit_one_pooled_ensemble(train_data_mod, rec_all, v = 10, acc_cut = 0.72, bayes_iter = 20)
+
+rf_fit       <- ens_all$rf_fit
+enet_fit     <- ens_all$enet_fit
+svm_fit      <- ens_all$svm_fit
+knn_fit      <- ens_all$knn_fit
+mlp_fit      <- ens_all$mlp_fit
+xgb_fit      <- ens_all$xgb_fit
+tree_fit     <- ens_all$tree_fit
+stack_fit_all <- ens_all$stack_fit
+
+ens_all$family_tbl
+ens_all$families_keep
+ens_all$rf_best
+ens_all$knn_best
+ens_all$xgb_best
+ens_all$tree_best
+```
+
+**Cross-validated model-family ranking.** This output summarizes the pooled cross-validated performance of the main model families before final test-set evaluation. In the current version, the stronger flexible candidates are usually concentrated among Random Forest, XGBoost, SVM, and Elastic Net, while the simplest tree options tend to be weaker.
+
+**Families kept for stacking and best hyperparameters.** These outputs show which model families were retained for the ensemble and what the selected tuning values look like. In practical terms, the tuning stage is favoring the more stable pooled candidates rather than extreme or highly unstable fits.
+
+## Model performance comparison
+
+This chunk compares all candidate models on the held-out test set. Its role in the paper is to determine which pooled models perform best under the same Accuracy-first evaluation rule, while still showing the added technical layer of average-probability and stacking ensembles.
+
+```{r performance_comparison}
+# This chunk evaluates all candidate models on the held-out test set.
+# It selects a threshold on the training data, applies that threshold to the test data,
+# and compares pooled models using Accuracy, F1, and AUC together.
+best_threshold <- function(truth, prob,
+                           optimize_for = c("accuracy", "f1"),
+                           grid = seq(0.05, 0.95, by = 0.01)) {
+  optimize_for <- match.arg(optimize_for)
+  truth <- factor(truth, levels = c("no", "yes"))
+
+  tibble(threshold = grid) %>%
+    mutate(
+      score = purrr::map_dbl(threshold, function(t) {
+        pred <- factor(dplyr::if_else(prob >= t, "yes", "no"),
+                       levels = c("no", "yes"))
+        if (optimize_for == "accuracy") {
+          yardstick::accuracy_vec(truth, pred)
+        } else {
+          yardstick::f_meas_vec(truth, pred, event_level = "second")
+        }
+      })
+    ) %>%
+    slice_max(score, n = 1, with_ties = FALSE)
+}
+
+eval_with_train_threshold <- function(train_truth, train_prob, test_truth, test_prob,
+                                      optimize_for = "accuracy") {
+  thr <- best_threshold(train_truth, train_prob,
+                        optimize_for = optimize_for)$threshold[[1]]
+
+  test_truth <- factor(test_truth, levels = c("no", "yes"))
+  test_class <- factor(dplyr::if_else(test_prob >= thr, "yes", "no"),
+                       levels = c("no", "yes"))
+
+  tibble(
+    Accuracy  = yardstick::accuracy_vec(test_truth, test_class),
+    F1_Score  = yardstick::f_meas_vec(test_truth, test_class, event_level = "second"),
+    AUC       = yardstick::roc_auc_vec(test_truth, test_prob, event_level = "second"),
+    Threshold = thr,
+    OptimizeFor = optimize_for
+  )
+}
+
+get_prob_yes <- function(fit_obj, new_df, fallback_fit = NULL) {
+  if (inherits(fit_obj, "model_stack")) {
+    prob_tbl <- tryCatch(
+      predict(fit_obj, new_data = new_df, type = "prob"),
+      error = function(e) NULL
+    )
+
+    if (is.null(prob_tbl) || !".pred_yes" %in% names(prob_tbl)) {
+      if (is.null(fallback_fit)) {
+        stop("Stacking ensemble retained no usable members; please provide a fallback_fit.")
+      }
+      return(predict(fallback_fit, new_data = new_df, type = "prob")$.pred_yes)
+    }
+
+    return(prob_tbl$.pred_yes)
+  }
+
+  predict(fit_obj, new_data = new_df, type = "prob")$.pred_yes
+}
+
+eval_model <- function(name, fit_obj, train_df, test_df,
+                       optimize_for = "accuracy",
+                       fallback_fit = NULL) {
+  train_prob <- get_prob_yes(fit_obj, train_df, fallback_fit = fallback_fit)
+  test_prob  <- get_prob_yes(fit_obj, test_df,  fallback_fit = fallback_fit)
+
+  eval_with_train_threshold(
+    train_df$romantic, train_prob,
+    test_df$romantic,  test_prob,
+    optimize_for = optimize_for
+  ) %>%
+    mutate(Model = name) %>%
+    dplyr::select(Model, Accuracy, F1_Score, AUC, Threshold, OptimizeFor)
+}
+
+eval_avg_prob <- function(name, fit_list, train_df, test_df, optimize_for = "accuracy") {
+  train_prob_mat <- sapply(fit_list, function(fit) get_prob_yes(fit, train_df))
+  test_prob_mat  <- sapply(fit_list, function(fit) get_prob_yes(fit, test_df))
+
+  train_prob <- rowMeans(train_prob_mat)
+  test_prob  <- rowMeans(test_prob_mat)
+
+  eval_with_train_threshold(
+    train_df$romantic, train_prob,
+    test_df$romantic,  test_prob,
+    optimize_for = optimize_for
+  ) %>%
+    mutate(Model = name) %>%
+    dplyr::select(Model, Accuracy, F1_Score, AUC, Threshold, OptimizeFor)
+}
+
+single_model_names <- c(
+  "Logistic (baseline)",
+  "Random Forest (tuned)",
+  "Decision Tree (tuned)",
+  "Elastic Net",
+  "SVM RBF",
+  "kNN",
+  "Neural Net (MLP)",
+  "XGBoost"
+)
+
+fit_lookup_all <- setNames(
+  list(logit_fit, rf_fit, tree_fit, enet_fit, svm_fit, knn_fit, mlp_fit, xgb_fit),
+  single_model_names
+)
+
+get_all_model_prob <- function(model_name, new_df) {
+  if (model_name %in% single_model_names) {
+    return(get_prob_yes(fit_lookup_all[[model_name]], new_df))
+  }
+  if (model_name == "Avg Prob (RF+XGB+SVM)") {
+    return(rowMeans(cbind(
+      get_prob_yes(rf_fit, new_df),
+      get_prob_yes(xgb_fit, new_df),
+      get_prob_yes(svm_fit, new_df)
+    )))
+  }
+  if (model_name == "Stacking Ensemble") {
+    return(get_prob_yes(stack_fit_all, new_df, fallback_fit = rf_fit))
+  }
+  stop("Unknown pooled model name.")
+}
+
+results_all <- bind_rows(
+  eval_model("Logistic (baseline)", logit_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Random Forest (tuned)", rf_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Decision Tree (tuned)", tree_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Elastic Net", enet_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("SVM RBF", svm_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("kNN", knn_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Neural Net (MLP)", mlp_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("XGBoost", xgb_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_avg_prob("Avg Prob (RF+XGB+SVM)", list(rf_fit, xgb_fit, svm_fit),
+                train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Stacking Ensemble", stack_fit_all, train_data_mod, test_data_mod,
+             optimize_for = "accuracy", fallback_fit = rf_fit)
+) %>%
+  arrange(desc(Accuracy), desc(AUC))
+
+results_all
+```
+
+**Interpretation.** This table compares the pooled candidate models on the held-out test set. It is useful because it shows whether the more advanced ensemble layer actually adds value beyond the strongest single model. In other words, this section keeps the technical breadth of the project while still reporting a clean pooled Accuracy-first comparison.
+
+## Main model comparison results
+
+This section summarizes the strongest pooled models by test accuracy. Because the exact values may change after preprocessing or tuning updates, the summary below is generated directly from the current result table.
+
+```{r main_results_summary, results='asis'}
+#| echo: false
+# This chunk identifies the strongest pooled single model and the strongest pooled model overall.
+# It prints a concise dynamic summary that updates automatically when the code is rerun.
+best_all_single <- results_all %>%
+  filter(Model %in% single_model_names) %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+best_all_overall <- results_all %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+summary_text <- glue::glue(
+"
+In the pooled sample, the best **single** model by test Accuracy is **{best_all_single$Model[[1]]}**, with Accuracy = {round(best_all_single$Accuracy[[1]], 3)}, F1 = {round(best_all_single$F1_Score[[1]], 3)}, and AUC = {round(best_all_single$AUC[[1]], 3)}.
+
+When the ensemble layer is also considered, the best **overall** pooled model is **{best_all_overall$Model[[1]]}**, with Accuracy = {round(best_all_overall$Accuracy[[1]], 3)}, F1 = {round(best_all_overall$F1_Score[[1]], 3)}, and AUC = {round(best_all_overall$AUC[[1]], 3)}.
+
+Taken together, the current version is now a pooled student-level analysis that keeps sex as a predictor, compares a full machine-learning model set, and still evaluates average-probability and stacking ensembles rather than relying on only one narrow model family.
+"
+)
+
+cat(summary_text)
+```
+
+## Quick pooled check: does keeping sex help?
+
+This chunk performs a lightweight pooled ablation check by comparing the logistic baseline with and without sex. Its role is not to replace the full model comparison, but to directly test whether keeping sex as a pooled predictor is worthwhile.
+
+```{r sex_ablation_check}
+# This chunk performs a lightweight pooled ablation check.
+# It compares the pooled logistic baseline with sex versus the same baseline without sex.
+sex_check <- bind_rows(
+  eval_model("Logistic with sex", logit_fit, train_data_mod, test_data_mod, optimize_for = "accuracy"),
+  eval_model("Logistic without sex", logit_fit_nosex, train_data_nosex, test_data_nosex, optimize_for = "accuracy")
+) %>%
+  arrange(desc(Accuracy), desc(AUC))
+
+sex_check
+```
+
+**Interpretation.** This table directly checks whether retaining sex as a pooled predictor helps the baseline model. If the `with sex` row is stronger, the result supports the decision to keep sex in the pooled pipeline rather than forcing the project to rely only on separate subgroup models.
+
+## ROC curve comparison
+
+This chunk plots ROC curves for the main pooled candidate models. Its role is to compare ranking performance visually, including the ensemble layer when it is available.
+
+```{r pooled_roc_curves}
+# This chunk builds ROC curves for the main pooled candidates.
+# It compares ranking performance visually rather than only threshold-based classification.
+get_roc_df <- function(truth, prob, model_name) {
+  yardstick::roc_curve(
+    tibble(truth = truth, prob = prob),
+    truth, prob,
+    event_level = "second"
+  ) %>%
+    dplyr::mutate(Model = model_name)
+}
+
+roc_list <- list(
+  get_roc_df(test_data_mod$romantic, get_prob_yes(logit_fit, test_data_mod), "Logistic (baseline)"),
+  get_roc_df(test_data_mod$romantic, get_prob_yes(rf_fit, test_data_mod), "Random Forest (tuned)"),
+  get_roc_df(test_data_mod$romantic, get_prob_yes(svm_fit, test_data_mod), "SVM RBF"),
+  get_roc_df(test_data_mod$romantic, get_prob_yes(xgb_fit, test_data_mod), "XGBoost"),
+  get_roc_df(test_data_mod$romantic, rowMeans(cbind(
+    get_prob_yes(rf_fit, test_data_mod),
+    get_prob_yes(xgb_fit, test_data_mod),
+    get_prob_yes(svm_fit, test_data_mod)
+  )), "Avg Prob (RF+XGB+SVM)")
+)
+
+stack_prob_all <- tryCatch(
+  get_prob_yes(stack_fit_all, test_data_mod, fallback_fit = rf_fit),
+  error = function(e) NULL
+)
+
+if (!is.null(stack_prob_all)) {
+  roc_list <- append(
+    roc_list,
+    list(get_roc_df(test_data_mod$romantic, stack_prob_all, "Stacking Ensemble"))
+  )
+}
+
+roc_all <- dplyr::bind_rows(roc_list)
+
+ggplot(roc_all, aes(x = 1 - specificity, y = sensitivity, color = Model)) +
+  geom_path(linewidth = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC curves for pooled candidate models",
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    color = "Model"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** This figure compares pooled ranking performance rather than only hard classification after thresholding. It is useful because some models may have only moderate Accuracy while still ranking students meaningfully from lower to higher relationship chance.
+
+## Model interpretation: global variable importance
+
+This section visualizes which variables the strongest tree-based pooled models rely on most heavily. Its role is to provide a more intuitive answer to the question: which variables most strongly predict whether a student is in a romantic relationship?
+
+```{r rf_xgb_importance}
+# This chunk visualizes the most important predictors used by the pooled Random Forest model.
+# Larger values mean that the model relied more heavily on that variable when making decisions.
+# The goal is to identify which predictors contribute most strongly to relationship classification.
+rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vip(num_features = 15) +
+  labs(
+    title = "Random Forest variable importance (pooled sample)",
+    x = "Importance",
+    y = NULL
+  ) +
+  theme_minimal()
+
+# This chunk does the same for the pooled XGBoost model.
+# It helps compare whether the boosting model highlights a similar or different predictor ranking.
+xgb_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vip(num_features = 15) +
+  labs(
+    title = "XGBoost variable importance (pooled sample)",
+    x = "Importance",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+**Random Forest importance.** For this plot, the longer bars mean the Random Forest relied more heavily on that variable when making predictions. Variables near the top of the chart therefore contribute more strongly to pooled relationship classification.
+
+**XGBoost importance.** This plot reports the same idea for XGBoost. It is useful because agreement between the Random Forest and XGBoost rankings increases confidence that the highlighted predictors are not just artifacts of one single model family.
+
+## Odds-ratio summary of selected predictors
+
+This chunk summarizes the direction and approximate strength of several key predictors from the pooled logistic model. Its role is to connect the predictive analysis back to interpretable psychological and behavioral variables.
+
+```{r or_plot}
+# This chunk summarizes the direction and approximate strength of selected predictors
+# from the pooled logistic model. It helps connect the predictive analysis
+# back to interpretable behavioral and demographic variables.
+or_df <- logit_fit %>%
+  extract_fit_parsnip() %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term %in% c("sex_M", "activities_yes", "internet_yes", "absences", "G1")) %>%
+  mutate(
+    term = recode(
+      term,
+      sex_M = "Male (vs Female)",
+      activities_yes = "Activities = yes",
+      internet_yes = "Internet = yes",
+      absences = "Absences",
+      G1 = "First-period grade (G1)"
+    ),
+    OR = exp(estimate),
+    OR_low = exp(conf.low),
+    OR_high = exp(conf.high)
+  )
+
+ggplot(or_df, aes(x = OR, y = reorder(term, OR))) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = OR_low, xmax = OR_high), height = 0.15) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Odds-ratio summary of selected pooled predictors",
+    x = "Odds ratio",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+**Interpretation.** This odds-ratio plot gives the pooled logistic model a more intuitive reading. Predictors with odds ratios above 1 are associated with higher relationship probability, while those below 1 are associated with lower probability. It is especially useful because it complements the tree-based importance plots with a more direction-sensitive baseline interpretation.
+
+## Best-model predictions: pooled sample
+
+This chunk reports the test-set predictions from the strongest pooled model under the current accuracy-first results. The best model is selected automatically from `results_all`, so it may be a single model or an ensemble.
+
+```{r best_model_predictions}
+# This chunk retrieves the strongest pooled model under the current results,
+# applies it to the held-out test set, and then shows both example predictions
+# and the confusion matrix after thresholding.
+best_all_model <- results_all %>%
+  slice_max(Accuracy, n = 1, with_ties = FALSE)
+
+best_model_name_all <- best_all_model$Model[[1]]
+thr_all_best <- best_all_model$Threshold[[1]]
+
+pred_all_best <- tibble(
+  truth = test_data_mod$romantic,
+  prob_yes = get_all_model_prob(best_model_name_all, test_data_mod)
+) %>%
+  mutate(
+    pred_class = factor(
+      if_else(prob_yes >= thr_all_best, "yes", "no"),
+      levels = c("no", "yes")
+    )
+  )
+
+cm_all_best <- yardstick::conf_mat(pred_all_best, truth = truth, estimate = pred_class)
+
+pred_all_best %>% slice_head(n = 10)
+cm_all_best
+```
+
+This output makes the pooled prediction process concrete. The first table shows the actual class (`truth`), the predicted probability of being in a relationship (`prob_yes`), and the final predicted class (`pred_class`) after applying the selected threshold. The confusion matrix then shows what kind of classification errors the current best pooled model tends to make.
+
+## Interpretation of best-model prediction outputs
+
+This section converts the confusion matrix into a short plain-language interpretation so the classification results are easier to read in the paper.
+
+```{r confusion_interpretation, results='asis'}
+# This chunk converts the pooled confusion matrix into a short plain-language summary.
+# It is intended to make the classification result easier to read,
+# especially for readers who are less comfortable with confusion-matrix notation.
+get_conf_counts <- function(cm_obj) {
+  tab <- cm_obj$table
+  list(
+    TN = unname(tab["no",  "no"]),
+    FN = unname(tab["no",  "yes"]),
+    FP = unname(tab["yes", "no"]),
+    TP = unname(tab["yes", "yes"])
+  )
+}
+
+describe_conf <- function(cm_obj, label, model_name) {
+  cc <- get_conf_counts(cm_obj)
+
+  err_sentence <- if (cc$TP == 0 && cc$FP == 0) {
+    "The model predicts every case as `no`, so its apparent accuracy is being driven mostly by the larger negative class rather than by meaningful class separation."
+  } else if (cc$FP > cc$FN) {
+    "The model makes more false positives than false negatives, which means it is somewhat more willing to predict `yes`."
+  } else if (cc$FN > cc$FP) {
+    "The model makes more false negatives than false positives, which means it is somewhat more conservative and misses some true `yes` cases."
+  } else {
+    "The model shows a fairly balanced error pattern between false positives and false negatives."
+  }
+
+  glue(
+"### {label}
+
+For the **{model_name}** model, the confusion matrix contains **{cc$TN} true negatives**, **{cc$TP} true positives**, **{cc$FP} false positives**, and **{cc$FN} false negatives**. {err_sentence} This helps clarify not only how accurate the model is, but also what kind of mistakes it tends to make.\n"
+  )
+}
+
+cat(describe_conf(cm_all_best, "Pooled sample interpretation", best_model_name_all))
+```
+
+Overall, this confusion-matrix summary tells a straightforward classification story. The pooled model is usable, but its performance should still be understood as moderate rather than perfect. That is exactly why the next section re-evaluates the model as a probability estimator rather than only as a hard classifier.
+
+## Probability-based evaluation: what this section is and why it matters
+
+The main results above evaluate the pooled models as **hard classifiers**. In other words, each student eventually receives a final `yes` or `no` prediction after a threshold is applied to the model's predicted probability. That view is useful, but it can also hide information. A model may do only moderately well as a strict classifier while still doing a meaningful job of ranking students from lower to higher relationship chance.
+
+For that reason, this section shifts from **classification-focused evaluation** to **probability-focused evaluation**. I compare the best hard-classification pooled model with the best probability-ranking pooled model, report AUC, Brier score, log loss, and a simple calibration error summary, and then visualize the pooled probability results using a calibration histogram and a KDE plot.
+
+## Probability-focused model selection and summary metrics
+
+This subsection identifies the strongest pooled probability model by AUC rather than by Accuracy. Its role is to check whether the best model for probability estimation is the same as, or different from, the best hard-classification model.
+
+```{r prob_eval_setup}
+# This chunk re-evaluates the pooled models from a probability-estimation perspective.
+# It identifies the best-Accuracy pooled model and the best-AUC pooled model,
+# prepares train/test probability tables, and computes probability-quality metrics.
+clip_prob <- function(p) {
+  pmin(pmax(as.numeric(p), 1e-6), 1 - 1e-6)
+}
+
+make_pred_tbl <- function(truth, prob) {
+  tibble(
+    truth = factor(truth, levels = c("no", "yes")),
+    prob_yes = clip_prob(prob)
+  )
+}
+
+brier_score <- function(truth, prob) {
+  y <- if_else(truth == "yes", 1, 0)
+  mean((y - clip_prob(prob))^2)
+}
+
+log_loss <- function(truth, prob) {
+  y <- if_else(truth == "yes", 1, 0)
+  prob <- clip_prob(prob)
+  -mean(y * log(prob) + (1 - y) * log(1 - prob))
+}
+
+best_all_acc  <- results_all %>% slice_max(Accuracy, n = 1, with_ties = FALSE)
+best_all_prob <- results_all %>% slice_max(AUC, n = 1, with_ties = FALSE)
+
+train_all_prob <- make_pred_tbl(
+  train_data_mod$romantic,
+  get_all_model_prob(best_all_prob$Model[[1]], train_data_mod)
+)
+
+test_all_prob <- make_pred_tbl(
+  test_data_mod$romantic,
+  get_all_model_prob(best_all_prob$Model[[1]], test_data_mod)
+)
+
+focus_compare <- tibble(
+  Group = "Pooled",
+  Best_Accuracy_Model = best_all_acc$Model[[1]],
+  Best_Accuracy = best_all_acc$Accuracy[[1]],
+  Best_AUC_Model = best_all_prob$Model[[1]],
+  Best_AUC = best_all_prob$AUC[[1]]
+)
+
+prob_summary <- tibble(
+  Group = "Pooled",
+  Model = best_all_prob$Model[[1]],
+  AUC = best_all_prob$AUC[[1]],
+  Brier = brier_score(test_all_prob$truth, test_all_prob$prob_yes),
+  LogLoss = log_loss(test_all_prob$truth, test_all_prob$prob_yes)
+)
+
+focus_compare
+prob_summary
+```
+
+**Probability-focused model-selection table.** This table compares the best hard-classification pooled model with the best probability-ranking pooled model. If these two models differ, that means the model that gives the highest Accuracy is not the same as the model that gives the best probability information.
+
+**Probability-metrics table.** This table reports AUC, Brier score, and log loss for the best-AUC pooled model. Higher AUC is better, while lower Brier score and log loss are better.
+
+```{r prob_eval_summary_text, results='asis'}
+# This chunk converts the pooled probability table into a short plain-language summary.
+match_text <- if (focus_compare$Best_Accuracy_Model[[1]] == focus_compare$Best_AUC_Model[[1]]) {
+  "The best pooled hard-classification model and the best pooled probability-ranking model are the same in this render."
+} else {
+  "The best pooled hard-classification model and the best pooled probability-ranking model are different in this render, which means Accuracy and probability quality are not telling exactly the same story."
+}
+
+cat(glue::glue(
+"**Probability-summary interpretation.** {match_text} The current best pooled probability model is **{prob_summary$Model[[1]]}**, with an AUC of **{round(prob_summary$AUC[[1]], 3)}**, a Brier score of **{round(prob_summary$Brier[[1]], 3)}**, and a log loss of **{round(prob_summary$LogLoss[[1]], 3)}**. This means the project should be interpreted not only in terms of yes/no accuracy, but also in terms of how informative the probability estimates are.\n\n"
+))
+```
+
+## Calibration histogram: predicted probability vs actual chance
+
+A calibration histogram checks whether the **probability values themselves** are trustworthy. In the plot below, the bars show the actual relationship rate inside each probability bin, the black points show the average predicted probability in that bin, and the labels above the bars show how many students fall into each bin. This version uses **more bins with smaller probability ranges**, and it still displays bins with `N = 0` so the full probability scale remains visible.
+
+```{r prob_plot_helpers}
+# This chunk defines helper functions for the probability plots and for the short
+# plain-language explanations placed directly after each figure.
+make_calibration_df <- function(pred_df, n_bins = 10) {
+  breaks <- seq(0, 1, length.out = n_bins + 1)
+
+  full_bins <- tibble(
+    bin_id = 1:n_bins,
+    bin_lower = breaks[-length(breaks)],
+    bin_upper = breaks[-1],
+    bin_mid = (bin_lower + bin_upper) / 2,
+    bin_label = paste0(
+      scales::percent(bin_lower, accuracy = 1),
+      "-",
+      scales::percent(bin_upper, accuracy = 1)
+    )
+  )
+
+  binned <- pred_df %>%
+    mutate(
+      truth_num = if_else(truth == "yes", 1, 0),
+      bin_id = cut(prob_yes, breaks = breaks, include.lowest = TRUE, right = FALSE, labels = FALSE)
+    ) %>%
+    group_by(bin_id) %>%
+    summarise(
+      n = n(),
+      mean_pred = mean(prob_yes),
+      actual_rate = mean(truth_num),
+      .groups = "drop"
+    )
+
+  full_bins %>%
+    left_join(binned, by = "bin_id") %>%
+    mutate(
+      n = dplyr::coalesce(n, 0L),
+      mean_pred = if_else(n > 0, mean_pred, NA_real_),
+      actual_rate = if_else(n > 0, actual_rate, 0),
+      text_y = pmax(actual_rate, dplyr::coalesce(mean_pred, 0)) + 0.04,
+      text_y = pmin(text_y, 1.08),
+      bin_label = factor(bin_label, levels = bin_label)
+    )
+}
+
+mean_abs_cal_error <- function(pred_df, n_bins = 10) {
+  cal_df <- make_calibration_df(pred_df, n_bins = n_bins) %>% filter(n > 0)
+  weighted.mean(abs(cal_df$actual_rate - cal_df$mean_pred), cal_df$n)
+}
+
+plot_calibration_hist <- function(pred_df, title_text, n_bins = 10) {
+  cal_df <- make_calibration_df(pred_df, n_bins = n_bins)
+
+  ggplot(cal_df, aes(x = bin_label)) +
+    geom_col(aes(y = actual_rate), alpha = 0.65) +
+    geom_point(aes(y = mean_pred), color = "black", size = 2.3, na.rm = TRUE) +
+    geom_text(aes(y = text_y, label = paste0("N=", n)), size = 3) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      limits = c(0, 1.10),
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    labs(
+      title = title_text,
+      x = "Predicted probability bin (10-percentage-point width)",
+      y = "Actual chance (bar) and average predicted probability (point)"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+plot_prob_kde <- function(pred_df, title_text) {
+  ggplot(pred_df, aes(x = prob_yes, fill = truth, color = truth)) +
+    geom_density(alpha = 0.20, linewidth = 1.1, adjust = 1.1) +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+    labs(
+      title = title_text,
+      x = "Predicted probability of being in a relationship",
+      y = "Density",
+      fill = "Actual class",
+      color = "Actual class"
+    ) +
+    theme_minimal()
+}
+
+describe_calibration_plot <- function(pred_df, group_label, model_name, n_bins = 10) {
+  cal_df <- make_calibration_df(pred_df, n_bins = n_bins) %>% filter(n > 0)
+  mae <- weighted.mean(abs(cal_df$actual_rate - cal_df$mean_pred), cal_df$n)
+  trend_cor <- suppressWarnings(cor(cal_df$mean_pred, cal_df$actual_rate, use = "complete.obs"))
+
+  quality_text <- case_when(
+    is.na(mae) ~ "difficult to judge because the bins are sparse",
+    mae < 0.05 ~ "fairly well calibrated",
+    mae < 0.10 ~ "reasonably calibrated but still somewhat noisy",
+    mae < 0.15 ~ "only loosely calibrated",
+    TRUE ~ "quite noisy and not especially well calibrated"
+  )
+
+  trend_text <- if (!is.na(trend_cor) && trend_cor > 0.60) {
+    "The observed relationship rate generally rises as the predicted probability bins rise"
+  } else if (!is.na(trend_cor) && trend_cor > 0.30) {
+    "The observed relationship rate rises somewhat with the predicted bins, although the pattern is not perfectly smooth"
+  } else {
+    "The observed relationship rate does not rise smoothly with the predicted bins"
+  }
+
+  glue::glue(
+"**{group_label} calibration histogram.** For this plot, each bar shows the actual relationship rate within one 10-percentage-point predicted-probability bin, the black point shows the average predicted probability in that same bin, and the label above each bar shows how many students fall into the bin, including empty bins. {trend_text}. The average absolute gap between the predicted and observed bin-level values is about **{scales::percent(mae, accuracy = 1)}**, so the **{model_name}** probabilities are {quality_text} in the {tolower(group_label)}.\n\n"
+  )
+}
+
+describe_kde_plot <- function(pred_df, group_label, model_name, auc_value) {
+  stats <- pred_df %>%
+    group_by(truth) %>%
+    summarise(mean_prob = mean(prob_yes), .groups = "drop")
+
+  no_mean  <- stats$mean_prob[stats$truth == "no"]
+  yes_mean <- stats$mean_prob[stats$truth == "yes"]
+  gap <- yes_mean - no_mean
+
+  shift_text <- case_when(
+    is.na(gap) ~ "cannot be judged clearly",
+    gap >= 0.15 ~ "a clear rightward shift",
+    gap >= 0.08 ~ "a noticeable rightward shift",
+    gap >= 0.03 ~ "a small but visible rightward shift",
+    TRUE ~ "very little rightward shift"
+  )
+
+  auc_text <- case_when(
+    auc_value >= 0.75 ~ "strong ranking ability",
+    auc_value >= 0.65 ~ "moderate ranking ability",
+    auc_value >= 0.55 ~ "limited but non-zero ranking ability",
+    TRUE ~ "very weak ranking ability"
+  )
+
+  glue::glue(
+"**{group_label} KDE plot.** For this plot, the two density curves show how the predicted probabilities are distributed for students who are actually in the `no` group and the `yes` group. In the {tolower(group_label)}, the true-`yes` cases receive an average predicted probability of **{scales::percent(yes_mean, accuracy = 1)}**, compared with **{scales::percent(no_mean, accuracy = 1)}** for the true-`no` cases, which is {shift_text}. Together with an AUC of **{round(auc_value, 3)}**, this suggests {auc_text} for the **{model_name}** probability estimates.\n\n"
+  )
+}
+```
+
+### Pooled sample calibration histogram
+
+```{r pooled_calibration_hist}
+# This chunk shows whether the pooled best-AUC model is well calibrated.
+# It uses more bins, smaller probability ranges, and explicit N labels for every bin,
+# including bins with zero students.
+plot_calibration_hist(
+  test_all_prob,
+  paste0("Calibration histogram: pooled sample (", best_all_prob$Model[[1]], ")"),
+  n_bins = 10
+)
+```
+
+```{r pooled_calibration_text, results='asis'}
+cat(describe_calibration_plot(test_all_prob, "Pooled sample", best_all_prob$Model[[1]], n_bins = 10))
+```
+
+## KDE plot of predicted probabilities
+
+A KDE plot looks at a different issue from calibration. Instead of asking whether the probabilities are on the correct scale, it asks whether the model gives **higher probabilities to the students who are actually in the `yes` group**. The more the `yes` curve shifts to the right of the `no` curve, the more useful the model is as a probability-ranking tool, even if the two curves still overlap.
+
+```{r pooled_kde_plot}
+# This chunk shows the probability-density separation for the pooled best-AUC model.
+# It compares the predicted probabilities for the true no and true yes groups.
+plot_prob_kde(
+  test_all_prob,
+  paste0("KDE of predicted probabilities: pooled sample (", best_all_prob$Model[[1]], ")")
+)
+```
+
+```{r pooled_kde_text, results='asis'}
+cat(describe_kde_plot(test_all_prob, "Pooled sample", best_all_prob$Model[[1]], best_all_prob$AUC[[1]]))
+```
+
+## Simple improvement: post-hoc probability calibration
+
+If the plots above show that the model ranks students reasonably well but the absolute probability scale is still somewhat off, a simple improvement is to **recalibrate the probabilities after model fitting** instead of retraining every model from scratch. The idea is straightforward: keep the original model predictions, then fit a small logistic calibration model on the training-set probabilities and apply that correction to the test set. This does not try to change the ordering of students very much; instead, it tries to make the reported probabilities themselves more realistic.
+
+```{r posthoc_calibration}
+# This chunk applies a simple logistic recalibration step to the pooled best-AUC model.
+# It compares the raw probabilities with the recalibrated probabilities using Brier score and log loss.
+fit_logistic_calibrator <- function(pred_df) {
+  cal_df <- pred_df %>%
+    mutate(
+      y = if_else(truth == "yes", 1, 0),
+      lp = qlogis(clip_prob(prob_yes))
+    )
+
+  if (dplyr::n_distinct(cal_df$lp) < 2) {
+    return(NULL)
+  }
+
+  glm(y ~ lp, data = cal_df, family = binomial())
+}
+
+apply_logistic_calibrator <- function(prob, cal_fit) {
+  prob <- clip_prob(prob)
+
+  if (is.null(cal_fit)) {
+    return(prob)
+  }
+
+  as.numeric(
+    plogis(
+      predict(
+        cal_fit,
+        newdata = tibble(lp = qlogis(prob)),
+        type = "link"
+      )
+    )
+  )
+}
+
+cal_fit_all <- fit_logistic_calibrator(train_all_prob)
+
+test_all_prob_cal <- test_all_prob %>%
+  mutate(prob_cal = apply_logistic_calibrator(prob_yes, cal_fit_all))
+
+calibration_compare <- tibble(
+  Group = "Pooled",
+  Model = best_all_prob$Model[[1]],
+  Raw_Brier = brier_score(test_all_prob_cal$truth, test_all_prob_cal$prob_yes),
+  Calibrated_Brier = brier_score(test_all_prob_cal$truth, test_all_prob_cal$prob_cal),
+  Raw_LogLoss = log_loss(test_all_prob_cal$truth, test_all_prob_cal$prob_yes),
+  Calibrated_LogLoss = log_loss(test_all_prob_cal$truth, test_all_prob_cal$prob_cal)
+) %>%
+  mutate(
+    Brier_Improvement = Raw_Brier - Calibrated_Brier,
+    LogLoss_Improvement = Raw_LogLoss - Calibrated_LogLoss
+  )
+
+calibration_compare
+```
+
+**Post-hoc calibration table.** This table compares the original pooled probability scores with a simple logistic recalibration fitted on the training-set probabilities. Positive improvement values mean the recalibrated probabilities are better by that metric. This is a lightweight improvement because it does not require rerunning the heavy model-tuning pipeline.
+
+```{r posthoc_calibration_text, results='asis'}
+# This chunk translates the pooled calibration-comparison table into a short interpretation.
+# It explains whether the simple recalibration step helps and why it matters.
+helpful_text <- if (calibration_compare$Brier_Improvement[[1]] > 0 || calibration_compare$LogLoss_Improvement[[1]] > 0) {
+  "In this render, the recalibration step improves at least one pooled probability metric."
+} else {
+  "In this render, the recalibration gains are small or mixed, so the main value of the section is diagnostic rather than corrective."
+}
+
+cat(glue::glue(
+"**Post-hoc calibration interpretation.** This comparison shows whether a simple probability recalibration can improve the pooled probability outputs without retraining the full model set. {helpful_text} Because this correction is monotonic, it mainly adjusts the probability scale rather than the ranking of students, so it is best understood as a probability-quality improvement rather than as a new classification model.\n\n"
+))
+```
+
+

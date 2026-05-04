@@ -1,0 +1,921 @@
+---
+title: "Predict Student Romantic Relationship Status"
+author: "Weiyang Sheng"
+format: pdf
+editor: visual
+---
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+## keep this chunk!
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  tidy = "styler",
+  fig.align = "center"
+)
+```
+
+## Introduction
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(DALEX)
+library(stacks)
+options(yardstick.event_first = FALSE)
+library(discrim)
+library(xgboost)
+library(kernlab)
+library(nnet)
+library(klaR)
+set.seed(123)
+```
+
+```{r import}
+student_por <- read_csv("student-por.csv")
+student_mat <- read_csv("student-mat.csv")
+
+student_mat <- student_mat %>% mutate(course = "Math")
+student_por <- student_por %>% mutate(course = "Portuguese")
+student_all <- bind_rows(student_mat, student_por)
+
+```
+
+```{r}
+students <- student_all %>%
+  mutate(
+    romantic   = factor(romantic, levels = c("no", "yes")),
+    sex        = factor(sex),
+    address    = factor(address),
+    Mjob       = factor(Mjob),
+    Fjob       = factor(Fjob),
+   Medu       = as.numeric(Medu),
+Fedu       = as.numeric(Fedu),
+Medu_pct   = 100 * Medu / 4,
+Fedu_pct   = 100 * Fedu / 4,
+edu_gap_pct = abs(Medu_pct - Fedu_pct),
+    Mjob_ses = case_when(
+      Mjob %in% c("teacher", "health") ~ "higher",
+      Mjob %in% c("services") ~ "middle",
+      TRUE ~ "lower"
+    ),
+    Mjob_ses = factor(Mjob_ses, levels = c("lower","middle","higher")),
+    Fjob_ses = case_when(
+      Fjob %in% c("teacher", "health") ~ "higher",
+      Fjob %in% c("services") ~ "middle",
+      TRUE ~ "lower"
+    ),
+    Fjob_ses = factor(Fjob_ses, levels = c("lower","middle","higher")),
+    activities = factor(activities, levels = c("no","yes")),
+    higher     = factor(higher,     levels = c("no","yes")),
+    internet   = factor(internet,   levels = c("no","yes")),
+    age        = as.numeric(age),
+    studytime  = as.numeric(studytime),
+    freetime   = as.numeric(freetime),
+    goout      = as.numeric(goout),
+    Dalc       = as.numeric(Dalc),
+    Walc       = as.numeric(Walc),
+    age_group = case_when(
+      age <= 16 ~ "15-16",
+      age == 17 ~ "17",
+      age == 18 ~ "18",
+      age >= 19 ~ "19+"
+    ),
+    age_group = factor(age_group, levels = c("15-16","17","18","19+")),
+    alc_mean = (Dalc + Walc) / 2,
+    alc_risk = factor(if_else(Walc >= 4 | Dalc >= 3, "higher", "lower"),
+                      levels = c("lower","higher")),
+    freetime_pct  = 100 * (freetime  - 1) / 4,
+    goout_pct     = 100 * (goout     - 1) / 4,
+    studytime_pct = 100 * (studytime - 1) / 3,
+    alc_mean_pct  = 100 * (alc_mean  - 1) / 4
+  )
+
+set.seed(123)
+splits <- initial_split(students, prop = 0.8, strata = romantic)
+train_data <- training(splits)
+test_data  <- testing(splits)
+train_data_mod <- train_data %>% dplyr::select(-sex)
+test_data_mod  <- test_data  %>% dplyr::select(-sex)
+train_F <- train_data %>% filter(sex == "F")
+test_F  <- test_data  %>% filter(sex == "F")
+
+train_M <- train_data %>% filter(sex == "M")
+test_M  <- test_data  %>% filter(sex == "M")
+train_F_mod <- train_F %>% dplyr::select(-sex)
+test_F_mod  <- test_F  %>% dplyr::select(-sex)
+
+train_M_mod <- train_M %>% dplyr::select(-sex)
+test_M_mod  <- test_M  %>% dplyr::select(-sex)
+
+train_M_mod <- train_M %>% dplyr::select(-sex)
+test_M_mod  <- test_M  %>% dplyr::select(-sex)
+
+prop.table(table(train_data$romantic))
+prop.table(table(test_data$romantic))
+```
+
+## Exploratory Analysis
+
+```{r}
+edu_base <- students %>%
+  group_by(sex) %>%
+  summarise(base = mean(romantic == "yes"), .groups = "drop")
+
+edu_parent <- students %>%
+  dplyr::select(sex, romantic, Medu_pct, Fedu_pct) %>%
+  pivot_longer(
+    cols = c(Medu_pct, Fedu_pct),
+    names_to = "parent",
+    values_to = "edu_pct"
+  ) %>%
+  mutate(
+    parent = recode(parent, Medu_pct = "Mother", Fedu_pct = "Father"),
+    edu_pct = factor(edu_pct, levels = c(0, 25, 50, 75, 100))
+  ) %>%
+  group_by(sex, parent, edu_pct) %>%
+  summarise(prop_yes = mean(romantic == "yes"), n = n(), .groups = "drop") %>%
+  left_join(edu_base, by = "sex") %>%
+  mutate(delta_pp = 100 * (prop_yes - base))
+
+pad_parent <- 2
+
+edu_parent_mother <- edu_parent %>% filter(parent == "Mother")
+ylim_m <- range(edu_parent_mother$delta_pp, na.rm = TRUE)
+
+ggplot(edu_parent_mother, aes(x = edu_pct, y = delta_pp, group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = n), alpha = 0.9) +
+  facet_wrap(~ sex, nrow = 1) +
+  scale_y_continuous(labels = function(x) paste0(x, " pp")) +
+  coord_cartesian(ylim = c(ylim_m[1] - pad_parent, ylim_m[2] + pad_parent)) +
+  labs(
+    title = "Mother education and relationship rate (difference from sex average)",
+    x = "Education level (0–100%)",
+    y = "Difference from sex average (percentage points)",
+    size = "N"
+  ) +
+  theme_minimal()
+
+edu_parent_father <- edu_parent %>% filter(parent == "Father")
+ylim_f <- range(edu_parent_father$delta_pp, na.rm = TRUE)
+
+ggplot(edu_parent_father, aes(x = edu_pct, y = delta_pp, group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = n), alpha = 0.9) +
+  facet_wrap(~ sex, nrow = 1) +
+  scale_y_continuous(labels = function(x) paste0(x, " pp")) +
+  coord_cartesian(ylim = c(ylim_f[1] - pad_parent, ylim_f[2] + pad_parent)) +
+  labs(
+    title = "Father education and relationship rate (difference from sex average)",
+    x = "Education level (0–100%)",
+    y = "Difference from sex average (percentage points)",
+    size = "N"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# ===== Dependency check example: does parental SES predict goout? =====
+goout_lm <- lm(goout ~ Medu_pct + Fedu_pct + Mjob_ses + Fjob_ses + sex, data = students)
+summary(goout_lm)
+
+# A simple visualization (mean goout by parental SES)
+students %>%
+  group_by(sex, Mjob_ses) %>%
+  summarise(goout_mean = mean(goout, na.rm = TRUE), n = n(), .groups = "drop") %>%
+  ggplot(aes(x = Mjob_ses, y = goout_mean)) +
+  geom_col() +
+  facet_wrap(~ sex) +
+  labs(
+    title = "Is going-out behavior associated with mother's job SES?",
+    x = "Mother job SES",
+    y = "Mean goout (1–5)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+students %>%
+  group_by(sex, edu_gap_pct) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = edu_gap_pct, y = prop_yes, color = sex, group = sex)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = c(0, 25, 50, 75, 100)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Education Gap (0–100%) vs Relationship Rate",
+    x = "Gap between parents' education (0–100%)",
+    y = "Proportion (romantic = yes)",
+    color = "Sex"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+students %>%
+  group_by(sex, edu_gap_pct) %>%
+  summarise(
+    n = n(),
+    yes_n = sum(romantic == "yes"),
+    prop_yes = mean(romantic == "yes"),
+    .groups = "drop"
+  ) %>%
+  arrange(sex, edu_gap_pct)
+```
+
+```{r}
+gap_base <- students %>%
+  group_by(sex) %>%
+  summarise(base = mean(romantic == "yes"), .groups = "drop")
+
+gap_df <- students %>%
+  mutate(
+    gap_group = case_when(
+      edu_gap_pct == 0 ~ "0",
+      edu_gap_pct == 25 ~ "25",
+      edu_gap_pct == 50 ~ "50",
+      edu_gap_pct >= 75 ~ "75-100"
+    ),
+    gap_group = factor(gap_group, levels = c("0", "25", "50", "75-100"))
+  ) %>%
+  group_by(sex, gap_group) %>%
+  summarise(prop_yes = mean(romantic == "yes"), n = n(), .groups = "drop") %>%
+  left_join(gap_base, by = "sex") %>%
+  mutate(delta_pp = 100 * (prop_yes - base))
+
+ylim_gap <- range(gap_df$delta_pp, na.rm = TRUE)
+pad_gap <- 2
+
+ggplot(gap_df, aes(x = gap_group, y = delta_pp, group = sex, color = sex)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = n), alpha = 0.9) +
+  scale_y_continuous(labels = function(x) paste0(x, " pp")) +
+  coord_cartesian(ylim = c(ylim_gap[1] - pad_gap, ylim_gap[2] + pad_gap)) +
+  labs(
+    title = "Education gap and relationship rate (difference from sex average)",
+    x = "Gap between parents' education",
+    y = "Difference from sex average (percentage points)",
+    color = "Sex",
+    size = "N"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+edu_combo <- students %>%
+  mutate(
+    Medu_cat = factor(Medu, levels = 0:4),
+    Fedu_cat = factor(Fedu, levels = 0:4)
+  ) %>%
+  group_by(sex, Medu_cat, Fedu_cat) %>%
+  summarise(
+    yes_n = sum(romantic == "yes"),
+    n = n(),
+    prop_yes = yes_n / n,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = paste0("yes=", yes_n, "\n", scales::percent(prop_yes, accuracy = 1)),
+   
+    text_col = if_else(yes_n >= median(yes_n, na.rm = TRUE), "white", "black")
+  )
+
+fill_max <- max(edu_combo$yes_n, na.rm = TRUE)
+
+plot_heatmap_yesn <- function(df_sex, sex_label) {
+  ggplot(df_sex, aes(x = Medu_cat, y = Fedu_cat, fill = yes_n)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = label, color = text_col), size = 3) +
+    scale_color_identity() +
+    scale_fill_gradient(
+      low = "white",
+      high = "orange",
+      limits = c(0, fill_max),
+      breaks = scales::pretty_breaks(n = 5),
+      na.value = "grey90"
+    ) +
+    labs(
+      title = paste0("Count of students in a relationship by parents' education (", sex_label, ")"),
+      x = "Mother education (0–4)",
+      y = "Father education (0–4)",
+      fill = "Count (romantic = yes)"
+    ) +
+    theme_minimal()
+}
+
+plot_heatmap_yesn(edu_combo %>% filter(sex == "F"), "Female")
+plot_heatmap_yesn(edu_combo %>% filter(sex == "M"), "Male")
+```
+
+```{r}
+students %>%
+  group_by(sex) %>%
+  summarise(prop_yes = mean(romantic == "yes"), n = n(), .groups = "drop") %>%
+  ggplot(aes(x = sex, y = prop_yes)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Relationship Rate by Sex",
+    x = "Sex",
+    y = "Proportion (romantic = yes)"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+students %>%
+  dplyr::select(sex, romantic, Mjob_ses, Fjob_ses) %>%
+  pivot_longer(cols = c(Mjob_ses, Fjob_ses), names_to = "parent", values_to = "job_ses") %>%
+  mutate(parent = recode(parent, Mjob_ses = "Mother", Fjob_ses = "Father")) %>%
+  group_by(sex, parent, job_ses) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = job_ses, y = prop_yes)) +
+  geom_col() +
+  facet_grid(sex ~ parent) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = " Parental Job SES vs Relationship Rate (by Sex)",
+    x = "Job SES",
+    y = "Proportion (romantic = yes)"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+students %>%
+  group_by(sex, freetime_pct) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = freetime_pct, y = prop_yes, color = sex, group = sex)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = c(0, 25, 50, 75, 100)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Free-time (0–100%) × Sex",
+    x = "Free-time (0–100%)",
+    y = "Proportion (romantic = yes)",
+    color = "Sex"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+students %>%
+  group_by(sex, alc_risk) %>%
+  summarise(prop_yes = mean(romantic == "yes"), .groups = "drop") %>%
+  ggplot(aes(x = alc_risk, y = prop_yes)) +
+  geom_col() +
+  facet_wrap(~ sex) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Alcohol Risk vs Relationship Rate (by Sex)",
+    x = "Alcohol risk",
+    y = "Proportion (romantic = yes)"
+  ) +
+  theme_minimal()
+```
+
+## Modeling Approach
+
+```{r}
+rec_F <- recipe(romantic ~ ., data = train_F_mod) %>%
+  step_rm(age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+          freetime_pct, goout_pct, studytime_pct, alc_mean_pct) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+rec_M <- recipe(romantic ~ ., data = train_M_mod) %>%
+  step_rm(age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+          freetime_pct, goout_pct, studytime_pct, alc_mean_pct) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+rec_all <- recipe(romantic ~ ., data = train_data_mod) %>%
+  step_rm(age, Dalc, Walc, Mjob, Fjob, Medu, Fedu,
+          freetime_pct, goout_pct, studytime_pct, alc_mean_pct) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+```
+
+## Logistic Regression
+
+```{r}
+logit_spec <- logistic_reg() %>% set_engine("glm")
+
+logit_wf <- workflow() %>%
+  add_recipe(rec_all) %>%
+  add_model(logit_spec)
+logit_fit <- fit(logit_wf, data = train_data_mod)
+
+logit_wf_F <- workflow() %>%
+  add_recipe(rec_F) %>%
+  add_model(logit_spec)
+logit_fit_F <- fit(logit_wf_F, data = train_F_mod)
+
+logit_wf_M <- workflow() %>%
+  add_recipe(rec_M) %>%
+  add_model(logit_spec)
+logit_fit_M <- fit(logit_wf_M, data = train_M_mod)
+
+logit_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(p.value)
+
+logit_fit_F %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(p.value)
+
+logit_fit_M %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(p.value)
+```
+
+```{r}
+metric_auc <- metric_set(roc_auc)
+
+# (Optional) speed-up: run resamples in parallel
+# install.packages("doParallel") if needed
+# library(doParallel)
+# registerDoParallel(cores = parallel::detectCores(logical = FALSE))
+
+# ============ 1) Random Forest (tuned) ============
+rf_spec_tune <- rand_forest(
+  mode  = "classification",
+  trees = tune(),
+  mtry  = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity")
+
+rf_wf_tune <- workflow() %>%
+  add_formula(romantic ~ age_group + address + studytime + freetime + goout +
+                activities + alc_mean + higher + internet +
+                Medu_pct + Fedu_pct + edu_gap_pct + Mjob_ses + Fjob_ses) %>%
+  add_model(rf_spec_tune)
+
+rf_params <- hardhat::extract_parameter_set_dials(rf_spec_tune) %>%
+  update(
+    trees = dials::trees(c(400, 1600)),
+    mtry  = dials::mtry(c(2, 14)),
+    min_n = dials::min_n(c(2, 25))
+  )
+
+# Smaller grids to reduce runtime (space-filling, not brute force)
+rf_grid_small <- dials::grid_space_filling(rf_params, size = 8)   # for choosing v
+rf_grid       <- dials::grid_space_filling(rf_params, size = 15)  # final tuning
+
+# ============ 2) Other models (tuned, smaller search) ============
+enet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet", maxit = 200000) %>%
+  set_mode("classification")
+
+svm_spec <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+# kNN: tune only the most important hyperparams (faster)
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+mlp_spec <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+# XGBoost: reduce tuned dimensions to avoid slow brute force
+xgb_spec <- boost_tree(
+  trees       = tune(),
+  tree_depth  = tune(),
+  learn_rate  = tune(),
+  mtry        = tune(),
+  min_n       = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost", verbosity = 0) %>%
+  set_mode("classification")
+
+# Decision tree: tune hyperparameters (requested in Progress report 2)
+tree_spec_tune <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth      = tune(),
+  min_n           = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tree_wf_tune <- workflow() %>%
+  add_formula(romantic ~ age_group + address + studytime + freetime + goout +
+                activities + alc_mean + higher + internet +
+                Medu_pct + Fedu_pct + edu_gap_pct + Mjob_ses + Fjob_ses) %>%
+  add_model(tree_spec_tune)
+
+# ---- helper: n predictors after recipe (for xgb mtry range)
+get_n_pred <- function(train_df, rec_obj) {
+  rec_obj %>%
+    prep(training = train_df, retain = TRUE) %>%
+    juice() %>%
+    dplyr::select(-romantic) %>%
+    ncol()
+}
+
+# ---- choose best v for RF quickly
+choose_best_v_rf <- function(train_df, v_candidates = c(5, 10)) {
+  v_tbl <- purrr::map_dfr(v_candidates, function(vv) {
+    set.seed(123)
+    folds <- vfold_cv(train_df, v = vv, strata = romantic)
+
+    set.seed(123)
+    res <- tune_grid(
+      rf_wf_tune,
+      resamples = folds,
+      grid = rf_grid_small,
+      metrics = metric_auc,
+      control = tune::control_grid(save_pred = FALSE)
+    )
+
+    best_auc <- show_best(res, metric = "roc_auc", n = 1) %>% dplyr::pull(mean)
+    tibble(v = vv, best_auc = best_auc)
+  })
+
+  best_v <- v_tbl %>%
+    slice_max(best_auc, n = 1, with_ties = FALSE) %>%
+    pull(v)
+
+  list(best_v = best_v, v_tbl = v_tbl)
+}
+
+fit_one_group_ensemble <- function(train_df, rec_obj, v_candidates = c(5, 10)) {
+
+  # 1) choose v
+  v_obj <- choose_best_v_rf(train_df, v_candidates = v_candidates)
+  set.seed(123)
+  folds <- vfold_cv(train_df, v = v_obj$best_v, strata = romantic)
+
+  # 2) workflows (recipe models)
+  enet_wf <- workflow() %>% add_recipe(rec_obj) %>% add_model(enet_spec)
+  svm_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(svm_spec)
+  knn_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(knn_spec)
+  mlp_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(mlp_spec)
+  xgb_wf  <- workflow() %>% add_recipe(rec_obj) %>% add_model(xgb_spec)
+
+  # 3) small, space-filling grids
+  enet_grid <- dials::grid_space_filling(hardhat::extract_parameter_set_dials(enet_spec), size = 12)
+  svm_grid  <- dials::grid_space_filling(hardhat::extract_parameter_set_dials(svm_spec),  size = 12)
+
+  knn_params <- hardhat::extract_parameter_set_dials(knn_spec) %>%
+    update(neighbors = dials::neighbors(c(3, 60)))
+  knn_grid <- dials::grid_space_filling(knn_params, size = 15)
+
+  mlp_grid <- dials::grid_space_filling(hardhat::extract_parameter_set_dials(mlp_spec), size = 12)
+
+  n_pred <- get_n_pred(train_df, rec_obj)
+  xgb_params <- hardhat::extract_parameter_set_dials(xgb_spec) %>%
+    update(
+      mtry       = dials::mtry(c(2, n_pred)),
+      trees      = dials::trees(c(300, 1500)),
+      tree_depth = dials::tree_depth(c(2, 8)),
+      min_n      = dials::min_n(c(2, 25)),
+      learn_rate = dials::learn_rate(c(-4, -1)),      # 10^-4 to 10^-1
+      sample_size = dials::sample_prop(c(0.6, 1.0))
+    )
+  xgb_grid <- dials::grid_space_filling(xgb_params, size = 15)
+
+  tree_params <- hardhat::extract_parameter_set_dials(tree_spec_tune) %>%
+    update(
+      tree_depth      = dials::tree_depth(c(1, 10)),
+      min_n           = dials::min_n(c(2, 30)),
+      cost_complexity = dials::cost_complexity(c(-4, -1))
+    )
+  tree_grid <- dials::grid_space_filling(tree_params, size = 15)
+
+  # Stack-compatible control: save predictions + workflow
+  ctrl_stack <- tune::control_grid(save_pred = TRUE, save_workflow = TRUE)
+
+  # 4) tune
+  set.seed(123)
+  rf_res   <- tune_grid(rf_wf_tune,   resamples = folds, grid = rf_grid,
+                        metrics = metric_auc, control = ctrl_stack)
+
+  set.seed(123)
+  enet_res <- tune_grid(enet_wf, resamples = folds, grid = enet_grid,
+                        metrics = metric_auc, control = ctrl_stack)
+
+  set.seed(123)
+  svm_res  <- tune_grid(svm_wf,  resamples = folds, grid = svm_grid,
+                        metrics = metric_auc, control = ctrl_stack)
+
+  set.seed(123)
+  knn_res  <- tune_grid(knn_wf,  resamples = folds, grid = knn_grid,
+                        metrics = metric_auc, control = ctrl_stack)
+
+  set.seed(123)
+  mlp_res  <- tune_grid(mlp_wf,  resamples = folds, grid = mlp_grid,
+                        metrics = metric_auc, control = ctrl_stack)
+
+  set.seed(123)
+  xgb_res  <- tune_grid(xgb_wf,  resamples = folds, grid = xgb_grid,
+                        metrics = metric_auc, control = ctrl_stack)
+
+  set.seed(123)
+  tree_res <- tune_grid(tree_wf_tune, resamples = folds, grid = tree_grid,
+                        metrics = metric_auc, control = ctrl_stack)
+
+  # 5) stacking
+  stack_fit <- stacks() %>%
+    add_candidates(rf_res) %>%
+    add_candidates(enet_res) %>%
+    add_candidates(svm_res) %>%
+    add_candidates(knn_res) %>%
+    add_candidates(mlp_res) %>%
+    add_candidates(xgb_res) %>%
+    add_candidates(tree_res) %>%
+    blend_predictions(metric = metric_auc) %>%
+    fit_members()
+
+  # 6) fit best models for final evaluation on test
+  fit_best <- function(wf_obj, res_obj, train_df_inner) {
+    best_params <- tune::select_best(res_obj, metric = "roc_auc")
+    wf_final <- tune::finalize_workflow(wf_obj, best_params)
+    fit(wf_final, data = train_df_inner)
+  }
+
+  list(
+    best_v = v_obj$best_v,
+    v_compare = v_obj$v_tbl,
+
+    rf_best   = tune::select_best(rf_res,   metric = "roc_auc"),
+    knn_best  = tune::select_best(knn_res,  metric = "roc_auc"),
+    xgb_best  = tune::select_best(xgb_res,  metric = "roc_auc"),
+    tree_best = tune::select_best(tree_res, metric = "roc_auc"),
+
+    rf_fit   = fit_best(rf_wf_tune, rf_res, train_df),
+    enet_fit = fit_best(enet_wf, enet_res, train_df),
+    svm_fit  = fit_best(svm_wf,  svm_res,  train_df),
+    knn_fit  = fit_best(knn_wf,  knn_res,  train_df),
+    mlp_fit  = fit_best(mlp_wf,  mlp_res,  train_df),
+    xgb_fit  = fit_best(xgb_wf,  xgb_res,  train_df),
+    tree_fit = fit_best(tree_wf_tune, tree_res, train_df),
+
+    stack_fit = stack_fit,
+
+    # keep tuning results for later diagnostics
+    knn_res = knn_res,
+    xgb_res = xgb_res,
+    rf_res  = rf_res,
+    tree_res = tree_res
+  )
+}
+
+ens_all <- fit_one_group_ensemble(train_data_mod, rec_all, v_candidates = c(5, 10))
+ens_F   <- fit_one_group_ensemble(train_F_mod,   rec_F,   v_candidates = c(5, 10))
+ens_M   <- fit_one_group_ensemble(train_M_mod,   rec_M,   v_candidates = c(5, 10))
+
+rf_fit       <- ens_all$rf_fit
+rf_fit_F     <- ens_F$rf_fit
+rf_fit_M     <- ens_M$rf_fit
+
+enet_fit     <- ens_all$enet_fit
+svm_fit      <- ens_all$svm_fit
+knn_fit      <- ens_all$knn_fit
+mlp_fit      <- ens_all$mlp_fit
+xgb_fit      <- ens_all$xgb_fit
+tree_fit     <- ens_all$tree_fit
+
+enet_fit_F   <- ens_F$enet_fit
+svm_fit_F    <- ens_F$svm_fit
+knn_fit_F    <- ens_F$knn_fit
+mlp_fit_F    <- ens_F$mlp_fit
+xgb_fit_F    <- ens_F$xgb_fit
+tree_fit_F   <- ens_F$tree_fit
+
+enet_fit_M   <- ens_M$enet_fit
+svm_fit_M    <- ens_M$svm_fit
+knn_fit_M    <- ens_M$knn_fit
+mlp_fit_M    <- ens_M$mlp_fit
+xgb_fit_M    <- ens_M$xgb_fit
+tree_fit_M   <- ens_M$tree_fit
+
+stack_fit_all <- ens_all$stack_fit
+stack_fit_F   <- ens_F$stack_fit
+stack_fit_M   <- ens_M$stack_fit
+
+# For reporting:
+ens_all$best_v
+ens_all$rf_best
+ens_all$knn_best
+ens_all$xgb_best
+ens_all$tree_best
+```
+
+Finally, according to the results of random forest analysis, as shown in the plot, age, frequency of going out, free time, drinking, parents' family background, and study time show significantly higher importance than other variables. Among them, students who are older and have a higher frequency of going out are most likely to be in a relationship. After this, I will do the model evaluation to dicide which model result should I finally pick. I also conducted 5-fold cross-validation on the training set. The average cross-validated accuracy was 78.4%, F1 score was 0.84, and AUC was 0.86 (they might be different when I render). These results show that random forest performs well, even when trained on different data subsets, making it a reliable choice for this prediction task.
+
+## Model Performance Comparison
+
+Now I compare how the three models performed on the test set (209 students who were not used in training). I consider each model’s ability to correctly classify students and to rank them by probability of being in love.
+
+```{r}
+best_f1_threshold <- function(truth, prob, grid = seq(0.05, 0.95, by = 0.01)) {
+  truth <- factor(truth, levels = c("no", "yes"))
+
+  tibble(threshold = grid) %>%
+    mutate(
+      f1 = purrr::map_dbl(threshold, function(t) {
+        pred <- factor(dplyr::if_else(prob >= t, "yes", "no"),
+                       levels = c("no", "yes"))
+        yardstick::f_meas_vec(truth, pred, event_level = "second")
+      })
+    ) %>%
+    slice_max(f1, n = 1, with_ties = FALSE)
+}
+
+eval_with_f1_thr <- function(train_truth, train_prob, test_truth, test_prob) {
+  thr <- best_f1_threshold(train_truth, train_prob)$threshold[[1]]
+
+  test_truth <- factor(test_truth, levels = c("no", "yes"))
+  test_class <- factor(dplyr::if_else(test_prob >= thr, "yes", "no"),
+                       levels = c("no", "yes"))
+
+  tibble(
+    Accuracy  = yardstick::accuracy_vec(test_truth, test_class),
+    F1_Score  = yardstick::f_meas_vec(test_truth, test_class, event_level = "second"),
+    AUC       = yardstick::roc_auc_vec(test_truth, test_prob, event_level = "second"),
+    Threshold = thr
+  )
+}
+
+get_prob_yes <- function(fit_obj, new_df) {
+  predict(fit_obj, new_df, type = "prob")$.pred_yes
+}
+
+eval_model <- function(name, fit_obj, train_df, test_df) {
+  train_prob <- get_prob_yes(fit_obj, train_df)
+  test_prob  <- get_prob_yes(fit_obj, test_df)
+
+  eval_with_f1_thr(train_df$romantic, train_prob, test_df$romantic, test_prob) %>%
+    mutate(Model = name) %>%
+    dplyr::select(Model, Accuracy, F1_Score, AUC, Threshold)
+}
+
+eval_avg_prob <- function(name, fit_list, train_df, test_df) {
+  train_prob_mat <- sapply(fit_list, function(fit) get_prob_yes(fit, train_df))
+  test_prob_mat  <- sapply(fit_list, function(fit) get_prob_yes(fit, test_df))
+
+  train_prob <- rowMeans(train_prob_mat)
+  test_prob  <- rowMeans(test_prob_mat)
+
+  eval_with_f1_thr(train_df$romantic, train_prob, test_df$romantic, test_prob) %>%
+    mutate(Model = name) %>%
+    dplyr::select(Model, Accuracy, F1_Score, AUC, Threshold)
+}
+
+results_all <- bind_rows(
+  eval_model("Logistic (baseline)", logit_fit, train_data_mod, test_data_mod),
+  eval_model("Random Forest (tuned)", rf_fit, train_data_mod, test_data_mod),
+  eval_model("Decision Tree (tuned)", tree_fit, train_data_mod, test_data_mod),
+  eval_model("Elastic Net", enet_fit, train_data_mod, test_data_mod),
+  eval_model("SVM RBF", svm_fit, train_data_mod, test_data_mod),
+  eval_model("kNN", knn_fit, train_data_mod, test_data_mod),
+  eval_model("Neural Net (MLP)", mlp_fit, train_data_mod, test_data_mod),
+  eval_model("XGBoost", xgb_fit, train_data_mod, test_data_mod),
+  eval_avg_prob("Avg Prob (RF+XGB+SVM)", list(rf_fit, xgb_fit, svm_fit), train_data_mod, test_data_mod),
+  eval_model("Stacking Ensemble", stack_fit_all, train_data_mod, test_data_mod)
+)
+
+results_F <- bind_rows(
+  eval_model("Logistic (baseline)", logit_fit_F, train_F_mod, test_F_mod),
+  eval_model("Decision Tree (tuned)", logit_fit_F, train_F_mod, test_F_mod),
+  eval_model("Random Forest (tuned)", rf_fit_F, train_F_mod, test_F_mod),
+  eval_model("Elastic Net", enet_fit_F, train_F_mod, test_F_mod),
+  eval_model("SVM RBF", svm_fit_F, train_F_mod, test_F_mod),
+  eval_model("kNN", knn_fit_F, train_F_mod, test_F_mod),
+  eval_model("Neural Net (MLP)", mlp_fit_F, train_F_mod, test_F_mod),
+  eval_model("XGBoost", xgb_fit_F, train_F_mod, test_F_mod),
+  eval_avg_prob("Avg Prob (RF+XGB+SVM)", list(rf_fit_F, xgb_fit_F, svm_fit_F), train_F_mod, test_F_mod),
+  eval_model("Stacking Ensemble", stack_fit_F, train_F_mod, test_F_mod)
+)
+
+results_M <- bind_rows(
+  eval_model("Logistic (baseline)", logit_fit_M, train_M_mod, test_M_mod),
+  eval_model("Decision Tree (tuned)", logit_fit_M, train_M_mod, test_M_mod),
+  eval_model("Random Forest (tuned)", rf_fit_M, train_M_mod, test_M_mod),
+  eval_model("Elastic Net", enet_fit_M, train_M_mod, test_M_mod),
+  eval_model("SVM RBF", svm_fit_M, train_M_mod, test_M_mod),
+  eval_model("kNN", knn_fit_M, train_M_mod, test_M_mod),
+  eval_model("Neural Net (MLP)", mlp_fit_M, train_M_mod, test_M_mod),
+  eval_model("XGBoost", xgb_fit_M, train_M_mod, test_M_mod),
+  eval_avg_prob("Avg Prob (RF+XGB+SVM)", list(rf_fit_M, xgb_fit_M, svm_fit_M), train_M_mod, test_M_mod),
+  eval_model("Stacking Ensemble", stack_fit_M, train_M_mod, test_M_mod)
+)
+
+results_all
+results_F
+results_M
+```
+
+```{r}
+get_roc_df <- function(truth, prob, model_name, sex_label) {
+  yardstick::roc_curve(tibble(truth = truth, prob = prob), truth, prob, event_level = "second") %>%
+    dplyr::mutate(Model = model_name, Sex = sex_label)
+}
+
+pred_F_logit <- predict(logit_fit_F, test_F_mod, type = "prob")$.pred_yes
+pred_F_rf    <- predict(rf_fit_F,    test_F_mod, type = "prob")$.pred_yes
+pred_F_svm   <- predict(svm_fit_F,   test_F_mod, type = "prob")$.pred_yes
+pred_F_xgb   <- predict(xgb_fit_F,   test_F_mod, type = "prob")$.pred_yes
+pred_F_stack <- predict(stack_fit_F, test_F_mod, type = "prob")$.pred_yes
+
+roc_F <- dplyr::bind_rows(
+  get_roc_df(test_F_mod$romantic, pred_F_logit, "Logistic (baseline)", "F"),
+  get_roc_df(test_F_mod$romantic, pred_F_rf,    "Random Forest (tuned)", "F"),
+  get_roc_df(test_F_mod$romantic, pred_F_svm,   "SVM RBF", "F"),
+  get_roc_df(test_F_mod$romantic, pred_F_xgb,   "XGBoost", "F"),
+  get_roc_df(test_F_mod$romantic, pred_F_stack, "Stacking", "F")
+)
+
+pred_M_logit <- predict(logit_fit_M, test_M_mod, type = "prob")$.pred_yes
+pred_M_rf    <- predict(rf_fit_M,    test_M_mod, type = "prob")$.pred_yes
+pred_M_svm   <- predict(svm_fit_M,   test_M_mod, type = "prob")$.pred_yes
+pred_M_xgb   <- predict(xgb_fit_M,   test_M_mod, type = "prob")$.pred_yes
+pred_M_stack <- predict(stack_fit_M, test_M_mod, type = "prob")$.pred_yes
+
+roc_M <- dplyr::bind_rows(
+  get_roc_df(test_M_mod$romantic, pred_M_logit, "Logistic (baseline)", "M"),
+  get_roc_df(test_M_mod$romantic, pred_M_rf,    "Random Forest (tuned)", "M"),
+  get_roc_df(test_M_mod$romantic, pred_M_svm,   "SVM RBF", "M"),
+  get_roc_df(test_M_mod$romantic, pred_M_xgb,   "XGBoost", "M"),
+  get_roc_df(test_M_mod$romantic, pred_M_stack, "Stacking", "M")
+)
+
+roc_all <- dplyr::bind_rows(roc_F, roc_M)
+
+ggplot(roc_all, aes(x = 1 - specificity, y = sensitivity, color = Model)) +
+  geom_path(linewidth = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  facet_wrap(~ Sex) +
+  labs(
+    title = "ROC Curves by Sex (Top models + Stacking)",
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    color = "Model"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# ===== kNN deep dive (what's going on?) =====
+ens_all$knn_best
+ens_F$knn_best
+ens_M$knn_best
+
+# kNN tuning curve (All)
+knn_auc_curve <- ens_all$knn_res %>%
+  collect_metrics() %>%
+  dplyr::filter(.metric == "roc_auc")
+
+ggplot(knn_auc_curve, aes(x = neighbors, y = mean, color = weight_func)) +
+  geom_line() +
+  geom_point(alpha = 0.6) +
+  labs(
+    title = "kNN tuning curve (All): CV ROC AUC vs k",
+    x = "Number of neighbors (k)",
+    y = "CV ROC AUC",
+    color = "weight_func"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+students %>%
+  group_by(sex, romantic) %>%
+  summarise(
+    freetime_pct  = mean(freetime_pct, na.rm = TRUE),
+    goout_pct     = mean(goout_pct, na.rm = TRUE),
+    studytime_pct = mean(studytime_pct, na.rm = TRUE),
+    alc_mean_pct  = mean(alc_mean_pct, na.rm = TRUE),
+    Medu_pct = mean(Medu_pct, na.rm = TRUE),
+Fedu_pct = mean(Fedu_pct, na.rm = TRUE),
+edu_gap_pct = mean(edu_gap_pct, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
