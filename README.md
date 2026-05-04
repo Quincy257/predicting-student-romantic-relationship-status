@@ -51,7 +51,7 @@ Main held-out test results:
 
 - Accuracy: 0.684
 - AUC: 0.686
-- Mean calibration gap: about 6%
+- The probability diagnostics suggest that the model provides useful group-level probability estimates, but not exact individual labels.
 
 The model is useful but moderate. It should be interpreted as a group-level pattern-finding tool, not as a deterministic classifier for individual students.
 
